@@ -1,0 +1,9 @@
+# 내려받은 에셋 — 재배포 금지 조건이 붙어 있어 저장소에 넣지 않는다.
+# 받는 법은 README.md 참고.
+assets/soldier/
+assets/orc/
+
+# 작업 부스러기
+_*.html
+shots/
+node_modules/
