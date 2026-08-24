@@ -30,9 +30,60 @@ struct Session
     CRingBufferST recvQ;         // 소유 워커 전용 — 단일 소유라 락 불필요
     CRingBufferMT sendQ;         // 게임 워커(생산) / 소유 워커(소비). U2.3부터 생산자 등장
 
+    // 방 소속 — 소유 epoll 워커만 읽고 쓴다 (JOIN 응답·절단 라우팅용)
+    bool     inRoom  = false;
+    uint32_t roomIdx = 0;
+    uint8_t  actorId = 0;
+
     Session() = default;
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
+};
+
+// dirty 비트맵 — 게임 워커가 "이 세션 송신링에 새 것 있음"을 표시하고,
+// 소유 epoll 워커가 1ms 라운드마다 자기 몫을 exchange(0) 으로 걷어 간다 (설계 §4).
+// 세션 구조체 안 플래그 순회(캐시라인 수백 개 × 1kHz)를 피하려고 밖에 dense 로 둔다.
+#include <climits>
+class DirtyMap
+{
+public:
+    bool Init(uint32_t maxSessions, uint32_t workerCount)
+    {
+        _stride = (maxSessions + 63) / 64;
+        _words.reset(new (std::nothrow) std::atomic<uint64_t>[_stride * workerCount]);
+        if (_words == nullptr)
+            return false;
+        for (uint32_t i = 0; i < _stride * workerCount; ++i)
+            _words[i].store(0, std::memory_order_relaxed);
+        return true;
+    }
+
+    void Mark(uint8_t worker, uint32_t sessIdx)
+    {
+        _words[worker * _stride + sessIdx / 64]
+            .fetch_or(1ull << (sessIdx % 64), std::memory_order_release);
+    }
+
+    // fn(sessIdx) — set 비트만 순회. 드레인 중 재set 은 다음 라운드가 회수한다.
+    template <typename F>
+    void Drain(uint8_t worker, F&& fn)
+    {
+        std::atomic<uint64_t>* base = &_words[worker * _stride];
+        for (uint32_t w = 0; w < _stride; ++w)
+        {
+            uint64_t v = base[w].exchange(0, std::memory_order_acquire);
+            while (v != 0)
+            {
+                const uint32_t b = static_cast<uint32_t>(__builtin_ctzll(v));
+                fn(w * 64 + b);
+                v &= v - 1;
+            }
+        }
+    }
+
+private:
+    std::unique_ptr<std::atomic<uint64_t>[]> _words;
+    uint32_t                                 _stride = 0;
 };
 
 class SessionPool

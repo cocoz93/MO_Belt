@@ -40,11 +40,12 @@ constexpr int kMaxCatchupSteps = 3;    // 설계 §6 — 그 이상 밀리면 re
 
 } // namespace
 
-bool GameWorker::Start(uint8_t id, unsigned totalWorkers, int64_t t0Ns)
+bool GameWorker::Start(uint8_t id, unsigned totalWorkers, int64_t t0Ns, RoomManager* rooms)
 {
     _id    = id;
     _total = totalWorkers == 0 ? 1 : totalWorkers;
     _t0Ns  = t0Ns;
+    _rooms = rooms;
     _running.store(true);
     _thread = std::thread([this] { Loop(); });
     return true;
@@ -99,13 +100,31 @@ void GameWorker::Loop()
 
 void GameWorker::TickOnce()
 {
-    // U2.2: 넣을큐/뺄큐 반영 → 방 순회 step() → 스냅샷 직렬화가 여기 들어온다.
-    // 지금은 페이싱 계측만 검증한다.
+    if (_rooms == nullptr)
+        return;
+
+    // 틱 경계: 새 방 접수 → 방마다 넣을큐 먼저·뺄큐 나중 반영. step() 이전이라
+    // 틱 본문(U3.1)은 제거 대상 세션을 절대 만지지 않는다.
+    _rooms->DrainRoomAddQ(_id, _myRooms);
+
+    for (size_t i = 0; i < _myRooms.size();)
+    {
+        if (_rooms->ProcessRoomQueues(*_myRooms[i]))
+        {
+            _myRooms[i] = _myRooms.back();      // 빈 방 소멸 — 목록에서 제거
+            _myRooms.pop_back();
+        }
+        else
+        {
+            // (U3.1) step(w, inputs) / (U2.3) 스냅샷 직렬화·dirty 표시
+            ++i;
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────
 
-bool GameService::Start(unsigned workerCount)
+bool GameService::Start(unsigned workerCount, RoomManager* rooms)
 {
     if (workerCount > static_cast<unsigned>(metrics::kMaxGameWorkers))
         return false;
@@ -116,7 +135,7 @@ bool GameService::Start(unsigned workerCount)
     for (unsigned i = 0; i < workerCount; ++i)
     {
         auto w = std::make_unique<GameWorker>();
-        if (!w->Start(static_cast<uint8_t>(i), workerCount, t0))
+        if (!w->Start(static_cast<uint8_t>(i), workerCount, t0, rooms))
             return false;
         _workers.push_back(std::move(w));
     }

@@ -9,12 +9,13 @@
 #include <thread>
 #include <vector>
 
+#include "Room.h"
 #include "Session.h"
 
 class EpollWorker
 {
 public:
-    bool Start(uint8_t id, uint16_t port, SessionPool* pool);
+    bool Start(uint8_t id, uint16_t port, SessionPool* pool, RoomManager* rooms, DirtyMap* dirty);
     void Stop();     // 플래그만 내린다 — 정리(세션 전부 절단·fd 닫기)는 소유 스레드가 루프 끝에서 한다
     ~EpollWorker() { Stop(); }
 
@@ -36,18 +37,20 @@ private:
     int                   _listenFd = -1;
     std::atomic<bool>     _running{false};
     std::thread           _thread;
-    SessionPool*          _pool = nullptr;
+    SessionPool*          _pool    = nullptr;
+    RoomManager*          _roomMgr = nullptr;
+    DirtyMap*             _dirty   = nullptr;
     std::vector<uint32_t> _mySessions;   // 소유 세션 idx 목록 — 소유 스레드 전용
 };
 
-// 워커 N개 + 세션 풀 묶음.
+// 워커 N개 묶음. 세션 풀·방 매니저·dirty 맵은 main 이 소유하고 빌려 쓴다.
 class NetService
 {
 public:
-    bool Start(uint16_t port, unsigned workerCount, uint32_t maxSessions);
+    bool Start(uint16_t port, unsigned workerCount,
+               SessionPool* pool, RoomManager* rooms, DirtyMap* dirty);
     void Stop();
 
 private:
-    SessionPool                               _pool;
     std::vector<std::unique_ptr<EpollWorker>> _workers;
 };

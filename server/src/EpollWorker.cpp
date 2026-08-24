@@ -34,10 +34,12 @@ constexpr int kMaxAcceptPerWake = 64;    // accept 폭주가 1ms 박자를 깨�
 // EpollWorker
 // ──────────────────────────────────────────────────────────────────
 
-bool EpollWorker::Start(uint8_t id, uint16_t port, SessionPool* pool)
+bool EpollWorker::Start(uint8_t id, uint16_t port, SessionPool* pool, RoomManager* rooms, DirtyMap* dirty)
 {
-    _id   = id;
-    _pool = pool;
+    _id      = id;
+    _pool    = pool;
+    _roomMgr = rooms;
+    _dirty   = dirty;
 
     _epfd = ::epoll_create1(0);
     if (_epfd < 0)
@@ -101,7 +103,16 @@ void EpollWorker::Loop()
             else
                 HandleSession(idx, gen, events[i].events);
         }
-        // (U2.3) 여기서 dirty 비트맵을 스캔해 송신링을 걷는다
+
+        // dirty 스캔 — 게임 워커가 표시한 세션의 송신링을 걷는다.
+        // 재활용된 슬롯의 옛 비트는 빈 링 flush 로 끝나는 무해한 no-op.
+        _dirty->Drain(_id, [this](uint32_t idx) {
+            if (idx >= _pool->Capacity())
+                return;
+            Session& s = _pool->At(idx);
+            if (s.owner == _id && !s.dead.load(std::memory_order_relaxed) && s.fd >= 0)
+                FlushSend(s);
+        });
     }
     CleanupInThread();
 }
@@ -263,6 +274,54 @@ void EpollWorker::Dispatch(Session& s, const uint8_t* msg, size_t len)
         SendBytes(s, msg, len);
         return;
 
+    case MsgType::C2S_JOIN:
+    {
+        if (len != sizeof(MSG_C2S_JOIN))
+        {
+            Disconnect(s);
+            return;
+        }
+        const MSG_C2S_JOIN* join = reinterpret_cast<const MSG_C2S_JOIN*>(msg);
+
+        MSG_S2C_JOIN_FAIL fail{};
+        fail.header.size = sizeof(fail);
+        fail.header.type = static_cast<uint16_t>(MsgType::S2C_JOIN_FAIL);
+
+        if (join->protocolVer != kProtocolVersion)
+        {
+            fail.reason = static_cast<uint8_t>(JoinFailReason::VersionMismatch);
+            metrics::g.joinFails.Inc();
+            SendBytes(s, &fail, sizeof(fail));
+            return;
+        }
+        if (s.inRoom)
+        {
+            fail.reason = static_cast<uint8_t>(JoinFailReason::AlreadyJoined);
+            metrics::g.joinFails.Inc();
+            SendBytes(s, &fail, sizeof(fail));
+            return;
+        }
+
+        uint8_t  actorId = 0;
+        uint32_t roomId  = 0;
+        if (!_roomMgr->Join(s, actorId, roomId))
+        {
+            fail.reason = static_cast<uint8_t>(JoinFailReason::NoCapacity);
+            metrics::g.joinFails.Inc();
+            SendBytes(s, &fail, sizeof(fail));
+            return;
+        }
+
+        MSG_S2C_JOIN_OK ok{};
+        ok.header.size = sizeof(ok);
+        ok.header.type = static_cast<uint16_t>(MsgType::S2C_JOIN_OK);
+        ok.actorId     = actorId;
+        ok.roomId      = roomId;
+        ok.serverTick  = 0;      // 방 틱 반영은 U2.3
+        SendBytes(s, &ok, sizeof(ok));
+        return;
+    }
+
     case MsgType::C2S_PING:
     {
         if (len != sizeof(MSG_C2S_PING))
@@ -361,6 +420,8 @@ void EpollWorker::Disconnect(Session& s)
         s.fd = -1;
     }
 
+    _roomMgr->OnSessionLeave(s);      // ③ 방 뺄큐 — 멤버가 쥔 gameRef 는 게임 워커가 반환
+
     for (size_t i = 0; i < _mySessions.size(); ++i)
     {
         if (_mySessions[i] == s.idx)
@@ -379,15 +440,13 @@ void EpollWorker::Disconnect(Session& s)
 // NetService
 // ──────────────────────────────────────────────────────────────────
 
-bool NetService::Start(uint16_t port, unsigned workerCount, uint32_t maxSessions)
+bool NetService::Start(uint16_t port, unsigned workerCount,
+                       SessionPool* pool, RoomManager* rooms, DirtyMap* dirty)
 {
-    if (!_pool.Init(maxSessions))
-        return false;
-
     for (unsigned i = 0; i < workerCount; ++i)
     {
         auto w = std::make_unique<EpollWorker>();
-        if (!w->Start(static_cast<uint8_t>(i), port, &_pool))
+        if (!w->Start(static_cast<uint8_t>(i), port, pool, rooms, dirty))
             return false;
         _workers.push_back(std::move(w));
     }

@@ -66,6 +66,10 @@ std::string BuildText()
     put("belt_sessions_active", g.accepts.Load() - g.disconnects.Load());   // 파생 게이지 — 누수 판독용
     put("belt_recv_bytes_total", g.recvBytes.Load());
     put("belt_send_bytes_total", g.sendBytes.Load());
+    put("belt_joins_total",     g.joins.Load());
+    put("belt_join_fails_total", g.joinFails.Load());
+    put("belt_rooms_created_total", g.roomsCreated.Load());
+    put("belt_rooms_active",    g.roomsActive.Load());
 
     // 게임 워커 페이싱 지표 — 버킷은 비누적 저장이라 여기서 누적(le 의미)으로 변환한다
     const int64_t gameCount = g.gameWorkerCount.Load();

@@ -19,6 +19,7 @@ add_executable(belt_server
     src/EpollWorker.cpp
     src/GameWorker.cpp
     src/Metrics.cpp
+    src/RoomManager.cpp
     src/SelfTest.cpp
 )
 target_include_directories(belt_server PRIVATE src)

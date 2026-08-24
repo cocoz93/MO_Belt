@@ -18,12 +18,43 @@ enum class MsgType : uint16_t
     S2C_ROOM_EVENT = 104,    // {kind u8, actorId u8, roomId u32, spawnQX u16, spawnQY u16}
 };
 
+// 와이어 호환 확인용 — JOIN 에 실려 오고, 다르면 즉시 JOIN_FAIL (빌드 불일치 fail-fast)
+constexpr uint16_t kProtocolVersion = 1;
+
+enum class JoinFailReason : uint8_t
+{
+    VersionMismatch = 1,
+    NoCapacity      = 2,
+    AlreadyJoined   = 3,
+};
+
 #pragma pack(push, 1)
 
 struct MsgHeader
 {
     uint16_t size;     // 패킷 전체 크기 (헤더 포함)
     uint16_t type;     // MsgType 값
+};
+
+struct MSG_C2S_JOIN
+{
+    MsgHeader header;
+    uint16_t  protocolVer;
+};
+
+// 클라 자기 식별 + 시계 맞추기 시드 (설계 §6)
+struct MSG_S2C_JOIN_OK
+{
+    MsgHeader header;
+    uint8_t   actorId;       // 스냅샷 속 "내 것" — 슬롯 0~3
+    uint32_t  roomId;
+    uint32_t  serverTick;    // 게임 워커 틱 반영은 U2.3
+};
+
+struct MSG_S2C_JOIN_FAIL
+{
+    MsgHeader header;
+    uint8_t   reason;        // JoinFailReason
 };
 
 struct MSG_C2S_PING
@@ -47,6 +78,9 @@ struct MSG_S2C_PONG
 // 파서 하드닝 상한 — 이 밖이면 즉시 절단. 스냅샷이 정의되면(U2.3) 재산정한다.
 constexpr size_t MAX_PACKET_SIZE = 1024;
 
-static_assert(sizeof(MsgHeader) == 4,      "MsgHeader 는 4바이트 고정");
-static_assert(sizeof(MSG_C2S_PING) == 12,  "PING 레이아웃");
-static_assert(sizeof(MSG_S2C_PONG) == 20,  "PONG 레이아웃");
+static_assert(sizeof(MsgHeader) == 4,        "MsgHeader 는 4바이트 고정");
+static_assert(sizeof(MSG_C2S_JOIN) == 6,     "JOIN 레이아웃");
+static_assert(sizeof(MSG_S2C_JOIN_OK) == 13, "JOIN_OK 레이아웃");
+static_assert(sizeof(MSG_S2C_JOIN_FAIL) == 5, "JOIN_FAIL 레이아웃");
+static_assert(sizeof(MSG_C2S_PING) == 12,    "PING 레이아웃");
+static_assert(sizeof(MSG_S2C_PONG) == 20,    "PONG 레이아웃");

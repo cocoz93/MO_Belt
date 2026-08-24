@@ -10,6 +10,8 @@
 #include <thread>
 #include <vector>
 
+#include "Room.h"
+
 constexpr int64_t kTickHz       = 60;
 constexpr int64_t kTickPeriodNs = 1000000000 / kTickHz;   // 16,666,666ns
 
@@ -17,25 +19,28 @@ class GameWorker
 {
 public:
     // t0Ns: 전 워커 공통 기준 시각(CLOCK_MONOTONIC ns). 위상은 안에서 계산.
-    bool Start(uint8_t id, unsigned totalWorkers, int64_t t0Ns);
+    bool Start(uint8_t id, unsigned totalWorkers, int64_t t0Ns, RoomManager* rooms);
     void Stop();
     ~GameWorker() { Stop(); }
 
 private:
     void Loop();
-    void TickOnce();     // U2.2 부터 방 순회가 들어온다
+    void TickOnce();     // 틱 경계: 방 추가 → 넣을큐/뺄큐 반영 → (U3.1 step → U2.3 스냅샷)
 
     uint8_t           _id    = 0;
     unsigned          _total = 1;
     int64_t           _t0Ns  = 0;
     std::atomic<bool> _running{false};
     std::thread       _thread;
+
+    RoomManager*       _rooms = nullptr;
+    std::vector<Room*> _myRooms;     // 소유 방 목록 — 이 스레드 전용
 };
 
 class GameService
 {
 public:
-    bool Start(unsigned workerCount);
+    bool Start(unsigned workerCount, RoomManager* rooms);
     void Stop();
 
 private:

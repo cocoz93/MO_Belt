@@ -98,23 +98,39 @@ int main(int argc, char** argv)
     }
     std::printf("belt_server: /metrics on 127.0.0.1:%u\n", static_cast<unsigned>(port));
 
+    // 공유 자원은 main 이 소유하고 서비스들이 빌려 쓴다
+    constexpr uint32_t kMaxSessions = 8192;
+    constexpr uint32_t kMaxRooms    = 4096;
+
+    SessionPool sessions;
+    DirtyMap    dirty;
+    RoomManager rooms;
+    if (!sessions.Init(kMaxSessions) || !dirty.Init(kMaxSessions, epollN == 0 ? 1 : epollN) ||
+        !rooms.Init(kMaxRooms, gameWorkers, &sessions))
+    {
+        std::fprintf(stderr, "belt_server: 풀 초기화 실패\n");
+        return 1;
+    }
+
     NetService net;
     if (listenPort != 0)
     {
-        if (!net.Start(listenPort, /*workerCount=*/4, /*maxSessions=*/8192))
+        if (gameWorkers == 0)
+            std::printf("belt_server: 주의 — 게임 워커 0개라 JOIN 은 전부 NoCapacity 로 거절된다\n");
+        if (!net.Start(listenPort, epollN, &sessions, &rooms, &dirty))
         {
             std::fprintf(stderr, "belt_server: 전송 계층 기동 실패 (port %u)\n",
                          static_cast<unsigned>(listenPort));
             return 1;
         }
-        std::printf("belt_server: listen on 0.0.0.0:%u (epoll 워커 4)\n",
-                    static_cast<unsigned>(listenPort));
+        std::printf("belt_server: listen on 0.0.0.0:%u (epoll 워커 %u)\n",
+                    static_cast<unsigned>(listenPort), epollN);
     }
 
     GameService game;
     if (gameWorkers != 0)
     {
-        if (!game.Start(gameWorkers))
+        if (!game.Start(gameWorkers, &rooms))
         {
             std::fprintf(stderr, "belt_server: 게임 워커 기동 실패 (%u개)\n", gameWorkers);
             return 1;

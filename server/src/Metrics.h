@@ -66,6 +66,11 @@ struct Counters
     Counter recvBytes;
     Counter sendBytes;
 
+    Counter joins;
+    Counter joinFails;
+    Counter roomsCreated;
+    Counter roomsActive;
+
     Counter gameWorkerCount;                      // 노출 범위 결정용
     GameWorkerStats game[kMaxGameWorkers];
 };
