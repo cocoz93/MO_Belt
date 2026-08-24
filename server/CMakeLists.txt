@@ -16,6 +16,8 @@ add_link_options(-rdynamic)
 
 add_executable(belt_server
     src/main.cpp
+    src/Metrics.cpp
+    src/SelfTest.cpp
 )
 target_include_directories(belt_server PRIVATE src)
 
