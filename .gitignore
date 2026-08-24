@@ -5,6 +5,7 @@ assets/orc/
 
 # 작업 부스러기
 _*.html
+_*.png
 shots/
 node_modules/
 

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>belt live</title>
+<style>
+  body { margin: 0; background: #1a1c22; color: #dde; font: 13px/1.4 sans-serif; }
+  #wrap { width: 960px; margin: 12px auto; }
+  canvas { display: block; background: #23262e; image-rendering: pixelated; }
+  #hud { padding: 6px 2px; color: #9ab; }
+  #hud b { color: #fd6; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv" width="960" height="540"></canvas>
+  <div id="hud">접속 중…</div>
+</div>
+<!--
+  서버 추종 렌더(1차) — 예측·재조정은 2차에서 logic.js 와 함께 들어온다.
+  주소 인자: ?ws=ws://127.0.0.1:9010   릴레이 주소
+            ?probe                     검증 모드 — rAF 대신 고정 스텝, 자동 입력, 상태를 title 로
+-->
+<script src="belt-proto.js"></script>
+<script src="live.js"></script>
+</body>
+</html>

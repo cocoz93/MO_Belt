@@ -1,0 +1,8 @@
+{
+  "name": "belt-web",
+  "private": true,
+  "description": "웹 클라(육안·시연 전용) + WS↔TCP 릴레이. 측정은 더미(TCP 직결) 몫이다.",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
