@@ -22,6 +22,13 @@ struct alignas(64) Counter
     void    Store(int64_t d) noexcept  { v.store(d, std::memory_order_relaxed); }
     int64_t Load() const noexcept      { return v.load(std::memory_order_relaxed); }
 
+    // 최대값 갱신 — 실패해도 다른 스레드가 더 큰 값을 넣은 것이니 그대로 둔다
+    void StoreMax(int64_t d) noexcept
+    {
+        int64_t cur = v.load(std::memory_order_relaxed);
+        while (d > cur && !v.compare_exchange_weak(cur, d, std::memory_order_relaxed)) {}
+    }
+
     Counter() = default;
     Counter(const Counter&) = delete;
     Counter& operator=(const Counter&) = delete;
@@ -34,6 +41,22 @@ int64_t ThreadCpuNs();
 // 스레드가 살아 있는 동안만 유효 — 지금은 장수 스레드(워커)만 등록한다.
 void RegisterThisThread(const char* name);
 
+// 게임 워커 oversleep 히스토그램 버킷 상한(µs). 마지막은 +inf.
+constexpr int64_t kOversleepBucketUs[] = { 50, 100, 200, 500, 1000, 2000, 5000, 10000 };
+constexpr int     kOversleepBuckets    = 9;    // 위 8개 + inf
+constexpr int     kMaxGameWorkers      = 16;
+
+// 게임 워커 하나의 페이싱 지표 — 워커당 한 벌이라 스레드 간 경합 없음(관측만 교차).
+struct GameWorkerStats
+{
+    Counter ticks;              // 실행한 step 수
+    Counter wakes;              // 기상 수 (히스토그램 표본 수)
+    Counter skippedTicks;       // rebase 로 건너뛴 틱 수 — 방 한계 지표(설계 §6)
+    Counter rebases;
+    Counter oversleepMaxNs;
+    Counter oversleepBucket[kOversleepBuckets];   // 비누적 저장 — 노출 시 누적 변환
+};
+
 // 서버가 노출하는 카운터 전부. 필드를 늘리면 BuildText() 도 같이 고친다.
 struct Counters
 {
@@ -42,6 +65,9 @@ struct Counters
     Counter disconnects;
     Counter recvBytes;
     Counter sendBytes;
+
+    Counter gameWorkerCount;                      // 노출 범위 결정용
+    GameWorkerStats game[kMaxGameWorkers];
 };
 extern Counters g;
 

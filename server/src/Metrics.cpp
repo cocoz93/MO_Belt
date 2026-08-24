@@ -67,6 +67,40 @@ std::string BuildText()
     put("belt_recv_bytes_total", g.recvBytes.Load());
     put("belt_send_bytes_total", g.sendBytes.Load());
 
+    // 게임 워커 페이싱 지표 — 버킷은 비누적 저장이라 여기서 누적(le 의미)으로 변환한다
+    const int64_t gameCount = g.gameWorkerCount.Load();
+    for (int64_t w = 0; w < gameCount && w < kMaxGameWorkers; ++w)
+    {
+        const GameWorkerStats& gw = g.game[w];
+        auto putW = [&](const char* name, int64_t v) {
+            std::snprintf(line, sizeof(line), "%s{worker=\"%lld\"} %lld\n",
+                          name, static_cast<long long>(w), static_cast<long long>(v));
+            out += line;
+        };
+        putW("belt_game_ticks_total",    gw.ticks.Load());
+        putW("belt_game_wakes_total",    gw.wakes.Load());
+        putW("belt_game_skipped_ticks_total", gw.skippedTicks.Load());
+        putW("belt_game_rebases_total",  gw.rebases.Load());
+        putW("belt_game_oversleep_max_ns", gw.oversleepMaxNs.Load());
+
+        int64_t cum = 0;
+        for (int b = 0; b < kOversleepBuckets; ++b)
+        {
+            cum += gw.oversleepBucket[b].Load();
+            if (b < kOversleepBuckets - 1)
+                std::snprintf(line, sizeof(line),
+                              "belt_game_oversleep_us_bucket{worker=\"%lld\",le=\"%lld\"} %lld\n",
+                              static_cast<long long>(w),
+                              static_cast<long long>(kOversleepBucketUs[b]),
+                              static_cast<long long>(cum));
+            else
+                std::snprintf(line, sizeof(line),
+                              "belt_game_oversleep_us_bucket{worker=\"%lld\",le=\"+Inf\"} %lld\n",
+                              static_cast<long long>(w), static_cast<long long>(cum));
+            out += line;
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lk(s_threadsLock);
         for (const auto& t : s_threads)

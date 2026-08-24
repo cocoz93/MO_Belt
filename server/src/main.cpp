@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "EpollWorker.h"
+#include "GameWorker.h"
 #include "Metrics.h"
 #include "SelfTest.h"
 
@@ -52,6 +53,7 @@ int main(int argc, char** argv)
 {
     uint16_t port       = 19100;
     uint16_t listenPort = 0;      // 0 = 전송 계층 끔
+    unsigned gameWorkers = 0;     // 0 = 게임 워커 끔
     int      runSecs    = -1;     // 음수 = 계속 떠 있음
     bool     selftest   = false;
 
@@ -63,6 +65,8 @@ int main(int argc, char** argv)
             port = static_cast<uint16_t>(std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--listen") == 0 && i + 1 < argc)
             listenPort = static_cast<uint16_t>(std::atoi(argv[++i]));
+        else if (std::strcmp(argv[i], "--game") == 0 && i + 1 < argc)
+            gameWorkers = static_cast<unsigned>(std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--run-secs") == 0 && i + 1 < argc)
             runSecs = std::atoi(argv[++i]);
     }
@@ -75,7 +79,9 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "belt_server: RLIMIT_NOFILE 상향 실패 — 기동 중단\n");
         return 1;
     }
-    if (!CheckCoreBudget(4, 7, 1, 2))
+    // 실제로 켤 워커 수로 예산을 검사한다 (epoll 은 --listen 있을 때 4 고정 — 시작값)
+    const unsigned epollN = (listenPort != 0) ? 4u : 0u;
+    if (!CheckCoreBudget(epollN, gameWorkers, 1, 2))
     {
         std::fprintf(stderr, "belt_server: 코어 예산 초과 — 워커 수를 줄일 것\n");
         return 1;
@@ -105,12 +111,24 @@ int main(int argc, char** argv)
                     static_cast<unsigned>(listenPort));
     }
 
+    GameService game;
+    if (gameWorkers != 0)
+    {
+        if (!game.Start(gameWorkers))
+        {
+            std::fprintf(stderr, "belt_server: 게임 워커 기동 실패 (%u개)\n", gameWorkers);
+            return 1;
+        }
+        std::printf("belt_server: game workers %u개 (60Hz, 위상 스태거)\n", gameWorkers);
+    }
+
     if (runSecs >= 0)
         std::this_thread::sleep_for(std::chrono::seconds(runSecs));
     else
         for (;;)
             std::this_thread::sleep_for(std::chrono::seconds(1));
 
+    game.Stop();
     net.Stop();
     ms.Stop();
     return 0;
