@@ -70,6 +70,17 @@ std::string BuildText()
     put("belt_join_fails_total", g.joinFails.Load());
     put("belt_rooms_created_total", g.roomsCreated.Load());
     put("belt_rooms_active",    g.roomsActive.Load());
+    put("belt_inputs_queued_total", g.inputsQueued.Load());
+    put("belt_input_ring_drops_total", g.inputRingDrops.Load());
+    put("belt_input_neutralized_total", g.inputNeutralized.Load());
+    put("belt_snapshots_sent_total", g.snapshotsSent.Load());
+    put("belt_snapshots_dropped_total", g.snapshotsDropped.Load());
+    for (int i = 0; i < 9; ++i)
+    {
+        std::snprintf(line, sizeof(line), "belt_input_ring_occupancy{n=\"%d\"} %lld\n",
+                      i, static_cast<long long>(g.inputRingOcc[i].Load()));
+        out += line;
+    }
 
     // 게임 워커 페이싱 지표 — 버킷은 비누적 저장이라 여기서 누적(le 의미)으로 변환한다
     const int64_t gameCount = g.gameWorkerCount.Load();

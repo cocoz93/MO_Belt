@@ -1,6 +1,38 @@
 #include "Room.h"
 
+#include <ctime>
+
+#include "GameWorker.h"
 #include "Metrics.h"
+
+namespace {
+
+int64_t MgrNowNs()
+{
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
+}
+
+void ResetWorld(SimWorld& w)
+{
+    w.tick = 0;
+    for (int i = 0; i < kSnapActors; ++i)
+        w.actors[i] = SimActor{};
+    // 오크 10 — 설계 §9 스폰표. AI 없이 정지(U3.1 전), separate 참여는 U3.1 부터.
+    for (int i = 0; i < 10; ++i)
+    {
+        SimActor& a = w.actors[kRoomMembers + i];
+        a.present = true;
+        a.kind    = 1;
+        a.x       = kOrcSpawn[i][0];
+        a.y       = kOrcSpawn[i][1];
+        a.face    = -1;
+        a.hp      = 3;
+    }
+}
+
+} // namespace
 
 bool RoomManager::Init(uint32_t roomCapacity, unsigned gameWorkerCount, SessionPool* sessions)
 {
@@ -41,8 +73,14 @@ Room* RoomManager::AllocRoom()
         r.pendingLeave.clear();
     }
     for (int i = 0; i < kRoomMembers; ++i)
-        r.members[i].used = false;
+        r.members[i] = Room::Member{};
     r.memberCount = 0;
+    {
+        std::lock_guard<std::mutex> il(r.inLock);
+        r.inQ.clear();
+    }
+    ResetWorld(r.world);
+    r.tickAtomic.store(0, std::memory_order_relaxed);
 
     // 가장 한가한 워커에 붙인다 — roomId % K 금지 (설계 §5)
     unsigned best = 0;
@@ -172,12 +210,22 @@ bool RoomManager::ProcessRoomQueues(Room& room)
             continue;
         }
         Room::Member& m = room.members[e.actorId];
+        m = Room::Member{};
         m.used      = true;
         m.sessIdx   = e.sessIdx;
         m.sessGen   = e.sessGen;
         m.sessOwner = s.owner;
         ++room.memberCount;
-        // (U3.1) 여기서 액터 스폰 — 스폰표 §9
+
+        // 플레이어 액터 스폰 — 설계 §9 스폰표 (이동은 U3.1)
+        SimActor& a = room.world.actors[e.actorId];
+        a.present = true;
+        a.kind    = 0;
+        a.state   = 0;
+        a.face    = 1;
+        a.x       = kPlayerSpawn[e.actorId][0];
+        a.y       = kPlayerSpawn[e.actorId][1];
+        a.hp      = 10;
     }
 
     // ── 뺄큐 나중 ──
@@ -190,6 +238,7 @@ bool RoomManager::ProcessRoomQueues(Room& room)
             {
                 m.used = false;
                 --room.memberCount;
+                room.world.actors[i].present = false;    // 스냅샷에 빈 슬롯으로 나간다
                 {
                     std::lock_guard<std::mutex> rl(room.lock);
                     room.seatUsed[i] = false;
@@ -236,4 +285,140 @@ void RoomManager::FreeRoomIfDrained(Room& room)
     ++room.gen;
     _freeRooms.push_back(room.idx);
     metrics::g.roomsActive.Add(-1);
+}
+
+void RoomManager::PushInput(Session& s, uint32_t seq, int8_t mx, int8_t my,
+                            uint8_t attack, uint8_t skill)
+{
+    if (!s.inRoom || s.roomIdx >= _cap)
+        return;
+    Room& room = _slots[s.roomIdx];
+    {
+        std::lock_guard<std::mutex> il(room.inLock);
+        room.inQ.push_back({ s.idx, s.gen, s.actorId, seq, mx, my, attack, skill });
+    }
+    metrics::g.inputsQueued.Inc();
+}
+
+void RoomManager::GetPingInfo(Session& s, uint32_t& outTick, uint32_t& outRemainUs)
+{
+    outTick     = 0;
+    outRemainUs = 0;
+    if (!s.inRoom || s.roomIdx >= _cap)
+        return;
+    Room& room = _slots[s.roomIdx];
+    outTick = room.tickAtomic.load(std::memory_order_relaxed);
+
+    const int64_t next = GameWorkerNextTickNs(room.gameWorker);
+    const int64_t now  = MgrNowNs();
+    if (next > now)
+        outRemainUs = static_cast<uint32_t>((next - now) / 1000);
+}
+
+void RoomManager::RoomTick(Room& room, DirtyMap& dirty)
+{
+    // ── 입력 라우팅: 방 큐 swap → 플레이어별 링 (seq 는 클라가 단조 증가로 보낸다) ──
+    static thread_local std::vector<InputCmd> batch;    // 워커 스레드 전용 재사용 버퍼
+    batch.clear();
+    {
+        std::lock_guard<std::mutex> il(room.inLock);
+        batch.swap(room.inQ);
+    }
+    for (const InputCmd& c : batch)
+    {
+        if (c.actorId >= kRoomMembers)
+            continue;
+        Room::Member& m = room.members[c.actorId];
+        if (!m.used || m.sessIdx != c.sessIdx || m.sessGen != c.sessGen)
+            continue;      // 옛 세대·자리 바뀐 입력 — 버린다
+        if (m.ringCount == kInputRingDepth)
+        {
+            // 가득 — oldest drop. 재적용 불일치가 생기는 지점이라 반드시 센다
+            m.ringHead = (m.ringHead + 1) % kInputRingDepth;
+            --m.ringCount;
+            metrics::g.inputRingDrops.Inc();
+        }
+        m.ring[(m.ringHead + m.ringCount) % kInputRingDepth] = c;
+        ++m.ringCount;
+    }
+
+    // ── 틱당 정확히 1개 소비 (불변식: 서버 적용 횟수 = 클라 재적용 제외 횟수) ──
+    for (int i = 0; i < kRoomMembers; ++i)
+    {
+        Room::Member& m = room.members[i];
+        if (!m.used)
+            continue;
+        metrics::g.inputRingOcc[m.ringCount <= 8 ? m.ringCount : 8].Inc();
+
+        if (m.ringCount > 0)
+        {
+            m.held = m.ring[m.ringHead];
+            m.ringHead = (m.ringHead + 1) % kInputRingDepth;
+            --m.ringCount;
+            m.lastInputSeq = m.held.seq;
+            m.emptyStreak  = 0;
+        }
+        else if (++m.emptyStreak > 10)
+        {
+            // 입력이 10틱 넘게 끊겼다 — 중립 전환 (설계 §6: 끊긴 사람이 벽으로 걷는 것 방지)
+            if (m.held.mx != 0 || m.held.my != 0 || m.held.attack != 0 || m.held.skill != 0)
+                metrics::g.inputNeutralized.Inc();
+            m.held.mx = 0; m.held.my = 0; m.held.attack = 0; m.held.skill = 0;
+        }
+        // 빈 틱(10틱 이내)은 m.held 유지 — lastInputSeq 불변
+    }
+
+    // ── (U3.1) 여기서 step(world, held×4) — 이동+separate+출구 ──
+
+    ++room.world.tick;
+    room.tickAtomic.store(room.world.tick, std::memory_order_relaxed);
+
+    // ── 20Hz(3틱마다) 전체 스냅샷 — 방 전체가 같은 바이트라 1회 직렬화로 끝 ──
+    if (room.world.tick % 3 != 0 || room.memberCount == 0)
+        return;
+
+    MSG_S2C_SNAPSHOT snap{};
+    snap.header.size = sizeof(snap);
+    snap.header.type = static_cast<uint16_t>(MsgType::S2C_SNAPSHOT);
+    snap.serverTick  = room.world.tick;
+    snap.actorCount  = kSnapActors;
+    for (int i = 0; i < kRoomMembers; ++i)
+        snap.lastInputSeq[i] = room.members[i].used ? room.members[i].lastInputSeq : 0;
+    for (int i = 0; i < kSnapActors; ++i)
+    {
+        const SimActor& a = room.world.actors[i];
+        SnapActor& o = snap.actors[i];
+        o.id   = static_cast<uint8_t>(i);
+        o.kind = a.kind;
+        if (!a.present)
+        {
+            o.state = 255;
+            continue;
+        }
+        o.state = a.state;
+        o.face  = a.face;
+        o.qx    = QuantPos(a.x);
+        o.qy    = QuantPos(a.y);
+        o.hp    = a.hp;
+    }
+
+    for (int i = 0; i < kRoomMembers; ++i)
+    {
+        Room::Member& m = room.members[i];
+        if (!m.used)
+            continue;
+        Session& s = _sessions->At(m.sessIdx);
+        if (s.gen != m.sessGen || s.dead.load(std::memory_order_relaxed))
+            continue;
+        if (s.sendQ.Enqueue(&snap, sizeof(snap)) == sizeof(snap))
+        {
+            metrics::g.snapshotsSent.Inc();
+            dirty.Mark(m.sessOwner, m.sessIdx);
+        }
+        else
+        {
+            // 가득 — 이 스냅샷은 버린다(전체 상태라 다음 것이 대체). 정밀 drop-oldest 는 후속.
+            metrics::g.snapshotsDropped.Inc();
+        }
+    }
 }

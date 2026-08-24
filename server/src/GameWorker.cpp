@@ -38,14 +38,22 @@ void RecordOversleep(metrics::GameWorkerStats& gw, int64_t oversleepNs)
 
 constexpr int kMaxCatchupSteps = 3;    // 설계 §6 — 그 이상 밀리면 rebase
 
+std::atomic<int64_t> g_nextTickAtNs[metrics::kMaxGameWorkers];
+
 } // namespace
 
-bool GameWorker::Start(uint8_t id, unsigned totalWorkers, int64_t t0Ns, RoomManager* rooms)
+int64_t GameWorkerNextTickNs(uint8_t worker)
+{
+    return g_nextTickAtNs[worker].load(std::memory_order_relaxed);
+}
+
+bool GameWorker::Start(uint8_t id, unsigned totalWorkers, int64_t t0Ns, RoomManager* rooms, DirtyMap* dirty)
 {
     _id    = id;
     _total = totalWorkers == 0 ? 1 : totalWorkers;
     _t0Ns  = t0Ns;
     _rooms = rooms;
+    _dirty = dirty;
     _running.store(true);
     _thread = std::thread([this] { Loop(); });
     return true;
@@ -72,6 +80,7 @@ void GameWorker::Loop()
 
     while (_running.load(std::memory_order_relaxed))
     {
+        g_nextTickAtNs[_id].store(next, std::memory_order_relaxed);
         SleepUntilNs(next);
         const int64_t now = NowNs();
         RecordOversleep(gw, now > next ? now - next : 0);
@@ -116,7 +125,7 @@ void GameWorker::TickOnce()
         }
         else
         {
-            // (U3.1) step(w, inputs) / (U2.3) 스냅샷 직렬화·dirty 표시
+            _rooms->RoomTick(*_myRooms[i], *_dirty);   // 입력 소비 → (U3.1 step) → 20Hz 스냅샷
             ++i;
         }
     }
@@ -124,7 +133,7 @@ void GameWorker::TickOnce()
 
 // ──────────────────────────────────────────────────────────────────
 
-bool GameService::Start(unsigned workerCount, RoomManager* rooms)
+bool GameService::Start(unsigned workerCount, RoomManager* rooms, DirtyMap* dirty)
 {
     if (workerCount > static_cast<unsigned>(metrics::kMaxGameWorkers))
         return false;
@@ -135,7 +144,7 @@ bool GameService::Start(unsigned workerCount, RoomManager* rooms)
     for (unsigned i = 0; i < workerCount; ++i)
     {
         auto w = std::make_unique<GameWorker>();
-        if (!w->Start(static_cast<uint8_t>(i), workerCount, t0, rooms))
+        if (!w->Start(static_cast<uint8_t>(i), workerCount, t0, rooms, dirty))
             return false;
         _workers.push_back(std::move(w));
     }

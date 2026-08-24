@@ -71,6 +71,13 @@ struct Counters
     Counter roomsCreated;
     Counter roomsActive;
 
+    Counter inputsQueued;
+    Counter inputRingDrops;        // 링 가득 → oldest drop (재적용 불일치 발생 지점 — 관측 필수)
+    Counter inputRingOcc[9];       // 소비 직전 점유 0..8 히스토그램 (지연 래칭 감시)
+    Counter inputNeutralized;      // 10틱 소진 → 중립 전환 횟수
+    Counter snapshotsSent;
+    Counter snapshotsDropped;      // 송신링 가득 — 이 스냅샷은 버림(다음 것이 대체)
+
     Counter gameWorkerCount;                      // 노출 범위 결정용
     GameWorkerStats game[kMaxGameWorkers];
 };

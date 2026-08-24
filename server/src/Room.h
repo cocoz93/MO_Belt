@@ -7,15 +7,59 @@
 //     (JOIN 직후 끊김 인터리브가 net 0 으로 상쇄되는 순서).
 //   · 방 슬롯은 풀에서 재활용되고 소멸자를 부르지 않는다 — 뮤텍스·큐가 살아 있어
 //     늦게 도착한 push 가 크래시 대신 무해한 no-op 이 된다 (엔트리의 세대 대조로 거른다).
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <vector>
 
+#include "Protocol.h"
 #include "Session.h"
 
 constexpr int kRoomMembers = 4;
+static_assert(kRoomMembers == kRoomMembersWire, "방 정원과 와이어 배열 크기는 짝");
+
+// ── 최소 월드 (U2.3: 정지 상태 스냅샷용. 이동·separate 는 U3.1 의 sim 이 채운다) ──
+// 스폰표는 설계 문서 §9 — C++ 과 (2차의) logic.js 확장이 같은 표를 쓴다.
+struct SimActor
+{
+    bool    present = false;
+    uint8_t kind    = 0;       // 0 플레이어 / 1 오크
+    uint8_t state   = 0;
+    int8_t  face    = 1;
+    double  x       = 0;
+    double  y       = 0;
+    int16_t hp      = 0;
+};
+
+struct SimWorld
+{
+    uint32_t tick = 0;
+    SimActor actors[kSnapActors];
+};
+
+// 설계 §9 스폰표 — 슬롯 0~3 플레이어 / 4~8 오크(logic.js SPAWNS) / 9~13 오크(신설)
+constexpr double kPlayerSpawn[kRoomMembers][2] = {
+    { 180, 100 }, { 140, 60 }, { 220, 140 }, { 100, 120 },
+};
+constexpr double kOrcSpawn[10][2] = {
+    { 520, 40 }, { 700, 120 }, { 980, 70 }, { 1180, 140 }, { 1330, 55 },
+    { 620, 150 }, { 840, 30 }, { 1060, 110 }, { 1240, 20 }, { 1450, 125 },
+};
+
+// epoll 워커 → 방 입력큐 엔트리 (MPSC: 여러 소유 워커가 넣고 게임 워커가 swap)
+struct InputCmd
+{
+    uint32_t sessIdx;
+    uint32_t sessGen;
+    uint8_t  actorId;
+    uint32_t seq;
+    int8_t   mx, my;
+    uint8_t  attack, skill;
+};
+
+constexpr int kInputRingDepth = 8;    // 플레이어별 입력 링 깊이(플랜: 4~8)
 
 // 게임 워커가 틱 경계에 처리할 대기열 엔트리
 struct RoomJoinEntry
@@ -46,16 +90,32 @@ struct Room
     std::vector<RoomJoinEntry>  pendingJoin;
     std::vector<RoomLeaveEntry> pendingLeave;
 
+    // ── 입력큐 (inLock 아래 — 죽은 방에 넣어도 무해, 소비 시 세대 대조로 거른다)
+    std::mutex            inLock;
+    std::vector<InputCmd> inQ;
+
     // ── 멤버 실체 (소유 게임 워커 전용 — 락 없음)
     struct Member
     {
         bool     used = false;
         uint32_t sessIdx = 0;
         uint32_t sessGen = 0;
-        uint8_t  sessOwner = 0;          // dirty 비트맵 표시용 (U2.3)
+        uint8_t  sessOwner = 0;          // dirty 비트맵 표시용
+
+        // 플레이어별 입력 링 — 틱당 정확히 1개 소비 (플랜 「확정 아키텍처」)
+        InputCmd ring[kInputRingDepth];
+        int      ringHead = 0;
+        int      ringCount = 0;
+        InputCmd held{};                 // 마지막 적용 입력 (빈 틱에 유지)
+        uint32_t lastInputSeq = 0;
+        int      emptyStreak = 0;        // 10틱 연속 비면 중립 입력 전환 (설계 §6)
     };
     Member members[kRoomMembers];
     int    memberCount = 0;
+
+    // ── 월드 (소유 게임 워커 전용) + 관측용 원자 틱 (PONG 이 relaxed 로 읽는다)
+    SimWorld              world;
+    std::atomic<uint32_t> tickAtomic{0};
 
     Room() = default;
     Room(const Room&) = delete;
@@ -74,10 +134,18 @@ public:
     // epoll 워커가 절단 경로에서 부른다. 방 뺄큐에 적재만 — 실제 제거는 게임 워커 틱 경계.
     void OnSessionLeave(Session& s);
 
+    // epoll 워커가 C2S_INPUT 에서 부른다 — 방 입력큐에 적재만.
+    void PushInput(Session& s, uint32_t seq, int8_t mx, int8_t my, uint8_t attack, uint8_t skill);
+
+    // epoll 워커가 PONG 을 만들 때 부른다 — 방 틱(원자 relaxed)과 다음 틱까지 잔여 µs.
+    void GetPingInfo(Session& s, uint32_t& outTick, uint32_t& outRemainUs);
+
     // ── 게임 워커 쪽 (소유 워커 전용) ──
     void DrainRoomAddQ(uint8_t worker, std::vector<Room*>& outMyRooms);
     // 틱 경계 처리: 넣을큐 먼저 → 뺄큐 나중. 방이 비어 죽으면 true (목록에서 뺄 것).
     bool ProcessRoomQueues(Room& room);
+    // 틱 본문: 입력 라우팅 → 틱당 1개 소비 → (U3.1 step) → 틱 증가 → 20Hz 스냅샷.
+    void RoomTick(Room& room, DirtyMap& dirty);
 
 private:
     Room* AllocRoom();

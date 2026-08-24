@@ -130,7 +130,7 @@ int main(int argc, char** argv)
     GameService game;
     if (gameWorkers != 0)
     {
-        if (!game.Start(gameWorkers, &rooms))
+        if (!game.Start(gameWorkers, &rooms, &dirty))
         {
             std::fprintf(stderr, "belt_server: 게임 워커 기동 실패 (%u개)\n", gameWorkers);
             return 1;

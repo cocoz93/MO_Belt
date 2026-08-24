@@ -322,6 +322,20 @@ void EpollWorker::Dispatch(Session& s, const uint8_t* msg, size_t len)
         return;
     }
 
+    case MsgType::C2S_INPUT:
+    {
+        if (len != sizeof(MSG_C2S_INPUT))
+        {
+            Disconnect(s);
+            return;
+        }
+        if (!s.inRoom)
+            return;      // 방 밖 입력은 조용히 버린다 (JOIN 왕복과의 시차)
+        const MSG_C2S_INPUT* in = reinterpret_cast<const MSG_C2S_INPUT*>(msg);
+        _roomMgr->PushInput(s, in->seq, in->mx, in->my, in->attack, in->skill);
+        return;
+    }
+
     case MsgType::C2S_PING:
     {
         if (len != sizeof(MSG_C2S_PING))
@@ -334,8 +348,7 @@ void EpollWorker::Dispatch(Session& s, const uint8_t* msg, size_t len)
         pong.header.size   = sizeof(MSG_S2C_PONG);
         pong.header.type   = static_cast<uint16_t>(MsgType::S2C_PONG);
         pong.clientTimeUs  = ping->clientTimeUs;
-        pong.serverTick    = 0;      // 게임 워커(U2.1)가 생기면 채운다
-        pong.tickRemainUs  = 0;
+        _roomMgr->GetPingInfo(s, pong.serverTick, pong.tickRemainUs);   // owner 즉답 — 게임 워커 경유 금지
         SendBytes(s, &pong, sizeof(pong));
         return;
     }

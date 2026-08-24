@@ -19,7 +19,7 @@ class GameWorker
 {
 public:
     // t0Ns: 전 워커 공통 기준 시각(CLOCK_MONOTONIC ns). 위상은 안에서 계산.
-    bool Start(uint8_t id, unsigned totalWorkers, int64_t t0Ns, RoomManager* rooms);
+    bool Start(uint8_t id, unsigned totalWorkers, int64_t t0Ns, RoomManager* rooms, DirtyMap* dirty);
     void Stop();
     ~GameWorker() { Stop(); }
 
@@ -34,15 +34,20 @@ private:
     std::thread       _thread;
 
     RoomManager*       _rooms = nullptr;
+    DirtyMap*          _dirty = nullptr;
     std::vector<Room*> _myRooms;     // 소유 방 목록 — 이 스레드 전용
 };
 
 class GameService
 {
 public:
-    bool Start(unsigned workerCount, RoomManager* rooms);
+    bool Start(unsigned workerCount, RoomManager* rooms, DirtyMap* dirty);
     void Stop();
 
 private:
     std::vector<std::unique_ptr<GameWorker>> _workers;
 };
+
+// 워커 w 의 다음 틱 절대 시각(CLOCK_MONOTONIC ns) — PONG 의 "다음 틱까지 잔여" 계산용.
+// 게임 워커가 매 기상마다 relaxed 로 발행한다.
+int64_t GameWorkerNextTickNs(uint8_t worker);
