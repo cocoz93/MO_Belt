@@ -1,6 +1,6 @@
 // belt_server — 진입점.
 // U1.2: 기동 하드닝(RLIMIT_NOFILE 상향 · 코어 예산 확인) + 계측 노출(/metrics) + 자기시험.
-// 전송 계층(U1.3)은 아직 없다 — --run-secs 로 잠깐 떠서 스크레이프만 받는다.
+// U1.3: --listen <포트> 로 전송 계층(SO_REUSEPORT epoll 워커) 기동 — ECHO·PING 왕복.
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -10,6 +10,7 @@
 #include <cstring>
 #include <thread>
 
+#include "EpollWorker.h"
 #include "Metrics.h"
 #include "SelfTest.h"
 
@@ -49,9 +50,10 @@ bool CheckCoreBudget(unsigned epollN, unsigned gameG, unsigned mainN, unsigned r
 
 int main(int argc, char** argv)
 {
-    uint16_t port     = 19100;
-    int      runSecs  = -1;       // 음수 = 계속 떠 있음
-    bool     selftest = false;
+    uint16_t port       = 19100;
+    uint16_t listenPort = 0;      // 0 = 전송 계층 끔
+    int      runSecs    = -1;     // 음수 = 계속 떠 있음
+    bool     selftest   = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -59,6 +61,8 @@ int main(int argc, char** argv)
             selftest = true;
         else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc)
             port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        else if (std::strcmp(argv[i], "--listen") == 0 && i + 1 < argc)
+            listenPort = static_cast<uint16_t>(std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--run-secs") == 0 && i + 1 < argc)
             runSecs = std::atoi(argv[++i]);
     }
@@ -88,12 +92,26 @@ int main(int argc, char** argv)
     }
     std::printf("belt_server: /metrics on 127.0.0.1:%u\n", static_cast<unsigned>(port));
 
+    NetService net;
+    if (listenPort != 0)
+    {
+        if (!net.Start(listenPort, /*workerCount=*/4, /*maxSessions=*/8192))
+        {
+            std::fprintf(stderr, "belt_server: 전송 계층 기동 실패 (port %u)\n",
+                         static_cast<unsigned>(listenPort));
+            return 1;
+        }
+        std::printf("belt_server: listen on 0.0.0.0:%u (epoll 워커 4)\n",
+                    static_cast<unsigned>(listenPort));
+    }
+
     if (runSecs >= 0)
         std::this_thread::sleep_for(std::chrono::seconds(runSecs));
     else
         for (;;)
             std::this_thread::sleep_for(std::chrono::seconds(1));
 
+    net.Stop();
     ms.Stop();
     return 0;
 }

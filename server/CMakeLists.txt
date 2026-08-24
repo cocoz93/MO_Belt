@@ -16,6 +16,7 @@ add_link_options(-rdynamic)
 
 add_executable(belt_server
     src/main.cpp
+    src/EpollWorker.cpp
     src/Metrics.cpp
     src/SelfTest.cpp
 )

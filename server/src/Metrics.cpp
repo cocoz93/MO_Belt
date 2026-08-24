@@ -152,13 +152,18 @@ void Server::Stop()
     if (!_running.exchange(false))
         return;
     if (_listenFd >= 0)
-    {
         ::shutdown(_listenFd, SHUT_RDWR);   // 블로킹 accept 를 깨운다 — close 만으로는 안 깨어남
+
+    if (_thread.joinable())
+        _thread.join();
+
+    // close 와 _listenFd 쓰기는 join 뒤에만 — 스레드가 살아 있는 동안 하면
+    // ① _listenFd 읽기와 경합(TSan 실측) ② 닫힌 번호가 재사용돼 엉뚱한 fd 를 accept 한다
+    if (_listenFd >= 0)
+    {
         ::close(_listenFd);
         _listenFd = -1;
     }
-    if (_thread.joinable())
-        _thread.join();
 }
 
 } // namespace metrics
