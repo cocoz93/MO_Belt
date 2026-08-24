@@ -68,6 +68,23 @@ struct MSG_S2C_JOIN_FAIL
     uint8_t   reason;        // JoinFailReason
 };
 
+enum class RoomEventKind : uint8_t
+{
+    Enter    = 1,    // (예약 — 입장·퇴장은 지금 스냅샷의 빈 슬롯 표시로 대체 중)
+    Leave    = 2,
+    RoomMove = 3,    // 출구 도달 → 다음 방. 새 방에서는 스폰표 위치에서 다시 시작
+};
+
+struct MSG_S2C_ROOM_EVENT
+{
+    MsgHeader header;
+    uint8_t   kind;          // RoomEventKind
+    uint8_t   actorId;
+    uint32_t  roomId;        // 새 방 id (RoomMove 일 때)
+    uint16_t  spawnQX;       // 재스폰 좌표 (1/32px 눈금)
+    uint16_t  spawnQY;
+};
+
 // 입력 = 유지 상태 + seq(=클라 틱, 단일 카운터). 서버는 플레이어별 링에 seq순 적재 후
 // 틱당 정확히 1개 소비한다 — 재적용 불변식(플랜 「확정 아키텍처」)의 와이어 쪽 절반.
 struct MSG_C2S_INPUT
@@ -134,4 +151,5 @@ static_assert(sizeof(MSG_C2S_INPUT) == 12,   "INPUT 레이아웃");
 static_assert(sizeof(MSG_C2S_PING) == 12,    "PING 레이아웃");
 static_assert(sizeof(MSG_S2C_PONG) == 20,    "PONG 레이아웃");
 static_assert(sizeof(SnapActor) == 10,       "SnapActor 레이아웃");
+static_assert(sizeof(MSG_S2C_ROOM_EVENT) == 14, "ROOM_EVENT 레이아웃");
 static_assert(sizeof(MSG_S2C_SNAPSHOT) == 4 + 4 + 1 + 16 + 140, "SNAPSHOT 레이아웃(165B)");

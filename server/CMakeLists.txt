@@ -21,6 +21,7 @@ add_executable(belt_server
     src/Metrics.cpp
     src/RoomManager.cpp
     src/SelfTest.cpp
+    src/Sim.cpp
 )
 target_include_directories(belt_server PRIVATE src)
 

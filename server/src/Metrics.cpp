@@ -70,6 +70,7 @@ std::string BuildText()
     put("belt_join_fails_total", g.joinFails.Load());
     put("belt_rooms_created_total", g.roomsCreated.Load());
     put("belt_rooms_active",    g.roomsActive.Load());
+    put("belt_room_moves_total", g.roomMoves.Load());
     put("belt_inputs_queued_total", g.inputsQueued.Load());
     put("belt_input_ring_drops_total", g.inputRingDrops.Load());
     put("belt_input_neutralized_total", g.inputNeutralized.Load());
@@ -170,9 +171,24 @@ void Server::Loop()
             continue;       // EINTR 등 — 재시도
         }
 
-        char discard[512];
-        ssize_t ignored = ::read(fd, discard, sizeof(discard));   // 요청은 안 본다 — 뭐가 오든 전체 덤프
-        (void)ignored;
+        // 요청 헤더 끝(\r\n\r\n)까지 읽는다 — 다 읽기 전에 닫으면 커널이 RST 를 보내
+        // 응답이 유실된다 (4천 소켓 부하에서 실측). 내용은 여전히 안 본다.
+        timeval tv{ 0, 500000 };
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        char   req[2048];
+        size_t got = 0;
+        while (got < sizeof(req))
+        {
+            const ssize_t n = ::read(fd, req + got, sizeof(req) - got);
+            if (n <= 0)
+                break;
+            got += static_cast<size_t>(n);
+            bool end = false;
+            for (size_t k = 3; k < got; ++k)
+                if (req[k-3]=='\r' && req[k-2]=='\n' && req[k-1]=='\r' && req[k]=='\n') { end = true; break; }
+            if (end)
+                break;
+        }
 
         std::string body = BuildText();
         char header[160];
@@ -193,6 +209,9 @@ void Server::Loop()
                 break;
             off += static_cast<size_t>(n);
         }
+        ::shutdown(fd, SHUT_WR);                       // 우리 쪽 끝을 알리고
+        ssize_t drained = ::read(fd, req, sizeof(req));   // 상대가 닫을 때까지 잠깐 드레인(RCVTIMEO 500ms)
+        (void)drained;
         ::close(fd);
     }
 }

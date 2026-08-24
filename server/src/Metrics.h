@@ -70,6 +70,7 @@ struct Counters
     Counter joinFails;
     Counter roomsCreated;
     Counter roomsActive;
+    Counter roomMoves;             // 출구 도달 → 다음 방 (측정 구간 라벨용 — 설계 §12)
 
     Counter inputsQueued;
     Counter inputRingDrops;        // 링 가득 → oldest drop (재적용 불일치 발생 지점 — 관측 필수)

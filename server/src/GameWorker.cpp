@@ -125,7 +125,10 @@ void GameWorker::TickOnce()
         }
         else
         {
-            _rooms->RoomTick(*_myRooms[i], *_dirty);   // 입력 소비 → (U3.1 step) → 20Hz 스냅샷
+            // 입력 소비 → step → 20Hz 스냅샷 → 출구 판정. 방이 이동하면 목록에서 교체
+            Room* moved = _rooms->RoomTick(*_myRooms[i], *_dirty);
+            if (moved != nullptr)
+                _myRooms[i] = moved;
             ++i;
         }
     }

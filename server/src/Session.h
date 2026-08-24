@@ -30,10 +30,13 @@ struct Session
     CRingBufferST recvQ;         // 소유 워커 전용 — 단일 소유라 락 불필요
     CRingBufferMT sendQ;         // 게임 워커(생산) / 소유 워커(소비). U2.3부터 생산자 등장
 
-    // 방 소속 — 소유 epoll 워커만 읽고 쓴다 (JOIN 응답·절단 라우팅용)
-    bool     inRoom  = false;
-    uint32_t roomIdx = 0;
-    uint8_t  actorId = 0;
+    // 방 소속. inRoom·actorId 는 소유 epoll 워커 전용.
+    // roomIdx 만 원자 — 방 이동 때 게임 워커가 새 방 번호를 써넣고(relaxed),
+    // 소유 워커는 입력 라우팅·절단 때 읽는다. 이동 직후 옛 방으로 간 입력은
+    // 소비 쪽 세대 대조가 버린다(유지 입력이라 다음 입력이 곧 갱신).
+    bool                  inRoom  = false;
+    std::atomic<uint32_t> roomIdx{0};
+    uint8_t               actorId = 0;
 
     Session() = default;
     Session(const Session&) = delete;
@@ -130,6 +133,9 @@ public:
 
         s.fd        = -1;
         s.wantWrite = false;
+        s.inRoom    = false;
+        s.roomIdx.store(0, std::memory_order_relaxed);
+        s.actorId   = 0;
         s.dead.store(false, std::memory_order_relaxed);
         s.refs.store(1, std::memory_order_relaxed);      // netRef
         return &s;

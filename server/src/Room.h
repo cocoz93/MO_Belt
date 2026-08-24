@@ -144,12 +144,16 @@ public:
     void DrainRoomAddQ(uint8_t worker, std::vector<Room*>& outMyRooms);
     // 틱 경계 처리: 넣을큐 먼저 → 뺄큐 나중. 방이 비어 죽으면 true (목록에서 뺄 것).
     bool ProcessRoomQueues(Room& room);
-    // 틱 본문: 입력 라우팅 → 틱당 1개 소비 → (U3.1 step) → 틱 증가 → 20Hz 스냅샷.
-    void RoomTick(Room& room, DirtyMap& dirty);
+    // 틱 본문: 입력 라우팅 → 틱당 1개 소비 → step → 틱 증가 → 20Hz 스냅샷 → 출구 판정.
+    // 방 이동이 일어나면 새 방 포인터를 반환한다(호출자가 목록에서 교체) — 옛 방은 회수됨.
+    Room* RoomTick(Room& room, DirtyMap& dirty);
 
 private:
     Room* AllocRoom();
+    Room* AllocRoomSlotLocked(uint8_t forceWorker, bool useMailbox);   // _lock 안에서만
     void  FreeRoomIfDrained(Room& room);   // dead && reservedSeats==0 이면 풀로
+    Room* ExitCheckAndMaybeTransfer(Room& room, DirtyMap& dirty);
+    Room* TransferRoom(Room& oldRoom, DirtyMap& dirty);                // 출구 도달 — 소유 워커에서만
 
     SessionPool* _sessions = nullptr;
 
