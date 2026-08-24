@@ -6,6 +6,7 @@
 // rooms-per-core 지표가 게임 워커 스레드 CPU 기준이라 해상도가 판정을 좌우한다.
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <thread>
 
@@ -87,20 +88,22 @@ extern Counters g;
 // 프로메테우스 텍스트 조립 (카운터 + 등록된 스레드 CPU).
 std::string BuildText();
 
-// /metrics 미니 HTTP 서버 — GET 이 뭐든 전체 덤프 하나만 준다. 요청 파싱 없음.
+// /metrics 미니 HTTP 서버 — GET 이 뭐든 공급자가 만든 덤프 하나만 준다. 요청 파싱 없음.
+// 공급자 주입식이라 서버(BuildText)와 더미가 같은 클래스를 쓴다.
 class Server
 {
 public:
-    bool Start(uint16_t port);
+    bool Start(uint16_t port, std::function<std::string()> provider);
     void Stop();    // shutdown() 으로 accept 를 깨운다 — close 만으로는 못 깨운다 (MMO F5 교훈)
     ~Server() { Stop(); }
 
 private:
     void Loop();
 
-    int               _listenFd = -1;
-    std::atomic<bool> _running{false};
-    std::thread       _thread;
+    int                          _listenFd = -1;
+    std::atomic<bool>            _running{false};
+    std::thread                  _thread;
+    std::function<std::string()> _provider;
 };
 
 } // namespace metrics

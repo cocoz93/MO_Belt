@@ -133,8 +133,9 @@ std::string BuildText()
     return out;
 }
 
-bool Server::Start(uint16_t port)
+bool Server::Start(uint16_t port, std::function<std::string()> provider)
 {
+    _provider = std::move(provider);
     _listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (_listenFd < 0)
         return false;
@@ -190,7 +191,7 @@ void Server::Loop()
                 break;
         }
 
-        std::string body = BuildText();
+        std::string body = _provider ? _provider() : std::string();
         char header[160];
         int hlen = std::snprintf(header, sizeof(header),
                                  "HTTP/1.1 200 OK\r\n"

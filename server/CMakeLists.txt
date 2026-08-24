@@ -27,3 +27,11 @@ target_include_directories(belt_server PRIVATE src)
 
 find_package(Threads REQUIRED)
 target_link_libraries(belt_server PRIVATE Threads::Threads)
+
+# 부하 생성기 — 수치의 정본(설계 §12). WSL 내부에서 서버에 TCP 직결로 붙는다.
+add_executable(belt_dummy
+    ../dummy/dummy_main.cpp
+    src/Metrics.cpp
+)
+target_include_directories(belt_dummy PRIVATE src)
+target_link_libraries(belt_dummy PRIVATE Threads::Threads)

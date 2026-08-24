@@ -91,7 +91,7 @@ int main(int argc, char** argv)
     metrics::RegisterThisThread("main");
 
     metrics::Server ms;
-    if (!ms.Start(port))
+    if (!ms.Start(port, &metrics::BuildText))
     {
         std::fprintf(stderr, "belt_server: /metrics %u 포트 바인드 실패\n", static_cast<unsigned>(port));
         return 1;
