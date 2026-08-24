@@ -1,0 +1,3 @@
+# 셸 스크립트는 WSL(리눅스)에서 실행된다 — CRLF 가 끼면 sh 가 \r 을 명령으로 읽어 터진다.
+# autocrlf=true 환경에서도 체크아웃이 LF 를 유지하게 못 박는다.
+*.sh text eol=lf
