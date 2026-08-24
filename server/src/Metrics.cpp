@@ -63,6 +63,7 @@ std::string BuildText()
     put("belt_up",              g.up.Load());
     put("belt_accepts_total",   g.accepts.Load());
     put("belt_disconnects_total", g.disconnects.Load());
+    put("belt_sessions_active", g.accepts.Load() - g.disconnects.Load());   // 파생 게이지 — 누수 판독용
     put("belt_recv_bytes_total", g.recvBytes.Load());
     put("belt_send_bytes_total", g.sendBytes.Load());
 
