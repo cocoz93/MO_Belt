@@ -7,6 +7,12 @@
 //     — 이 게이트가 깨진 런은 서버 수치도 무효다.
 //
 //   기본 입력은 mx=0(정지) — 이동하면 출구 방 이동이 발동해 방 수 판독이 흔들린다.
+//
+//   모드 둘:
+//     --mode game (기본) : JOIN → 60Hz 입력 → 스냅샷 소비. 게임까지 포함한 부하.
+//     --mode echo        : JOIN 없이 ECHO 만 60Hz 로 왕복. 서버를 `--game 0` 으로 띄워
+//                          전송 계층만 남긴 뒤 재는 기준선용(설계 §12 의 계층 분리).
+//                          ECHO 는 INPUT 과 같은 12B 라 전송량이 같고, 왕복 지연도 같이 잰다.
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -37,6 +43,23 @@ namespace {
 constexpr int64_t kLoopBucketUs[] = { 50, 100, 200, 500, 1000, 2000, 5000, 10000, 40000 };
 constexpr int     kLoopBuckets    = 10;   // 위 9개 + inf. 게이트: p99 < 40ms (MMO 관례)
 
+// 왕복 지연 버킷 — 에코 모드에서만 채운다. 루프 버킷과 값이 같아도 뜻이 달라 따로 둔다.
+constexpr int64_t kRttBucketUs[] = { 50, 100, 200, 500, 1000, 2000, 5000, 10000, 40000 };
+constexpr int     kRttBuckets    = 10;
+
+// 에코 모드 — 게임 워커를 끈 서버(`--game 0`)에 붙어 전송 계층만 재는 기준선용.
+// JOIN 을 하지 않으므로 방·틱·스냅샷이 개입하지 않는다.
+bool g_echoMode = false;
+
+#pragma pack(push, 1)
+struct EchoPacket
+{
+    MsgHeader header;
+    int64_t   sentNs;    // 왕복 지연용 — 서버는 내용을 보지 않고 그대로 되돌린다
+};
+#pragma pack(pop)
+static_assert(sizeof(EchoPacket) == 12, "ECHO 는 INPUT(12B) 과 같은 크기 — 전송량을 맞춰야 비교가 선다");
+
 struct DummyStats
 {
     Counter active;          // ACTIVE 상태 세션 수
@@ -50,6 +73,10 @@ struct DummyStats
     Counter loops;
     Counter loopBucket[kLoopBuckets];
     Counter loopMaxUs;
+    Counter echoSent;        // 아래 셋은 에코 모드 전용
+    Counter echoRecv;
+    Counter rttBucket[kRttBuckets];
+    Counter rttMaxUs;
 };
 DummyStats g_stats;
 
@@ -90,6 +117,24 @@ std::string BuildDummyText()
             std::snprintf(line, sizeof(line), "dummy_loop_us_bucket{le=\"+Inf\"} %lld\n",
                           static_cast<long long>(cum));
         out += line;
+    }
+    if (g_echoMode)
+    {
+        put("dummy_echo_sent_total", g_stats.echoSent.Load());
+        put("dummy_echo_recv_total", g_stats.echoRecv.Load());
+        put("dummy_rtt_max_us",      g_stats.rttMaxUs.Load());
+        int64_t rcum = 0;
+        for (int b = 0; b < kRttBuckets; ++b)
+        {
+            rcum += g_stats.rttBucket[b].Load();
+            if (b < kRttBuckets - 1)
+                std::snprintf(line, sizeof(line), "dummy_rtt_us_bucket{le=\"%lld\"} %lld\n",
+                              static_cast<long long>(kRttBucketUs[b]), static_cast<long long>(rcum));
+            else
+                std::snprintf(line, sizeof(line), "dummy_rtt_us_bucket{le=\"+Inf\"} %lld\n",
+                              static_cast<long long>(rcum));
+            out += line;
+        }
     }
     return out;
 }
@@ -153,6 +198,9 @@ private:
         int64_t snapshots = 0, inputs = 0, loops = 0;
         int64_t buckets[kLoopBuckets] = {};
         int64_t maxUs = 0;
+        int64_t echoSent = 0, echoRecv = 0;
+        int64_t rttBuckets[kRttBuckets] = {};
+        int64_t rttMaxUs = 0;
         void Flush()
         {
             g_stats.snapshots.Add(snapshots);  snapshots = 0;
@@ -160,6 +208,10 @@ private:
             g_stats.loops.Add(loops);          loops = 0;
             for (int b = 0; b < kLoopBuckets; ++b) { g_stats.loopBucket[b].Add(buckets[b]); buckets[b] = 0; }
             g_stats.loopMaxUs.StoreMax(maxUs); maxUs = 0;
+            g_stats.echoSent.Add(echoSent);    echoSent = 0;
+            g_stats.echoRecv.Add(echoRecv);    echoRecv = 0;
+            for (int b = 0; b < kRttBuckets; ++b) { g_stats.rttBucket[b].Add(rttBuckets[b]); rttBuckets[b] = 0; }
+            g_stats.rttMaxUs.StoreMax(rttMaxUs); rttMaxUs = 0;
         }
     } _local;
 };
@@ -206,6 +258,17 @@ void Worker::OnEvent(size_t idx, uint32_t ev)
         ::getsockopt(c.fd, SOL_SOCKET, SO_ERROR, &err, &len);
         if (err != 0) { Kill(c, false); g_stats.connectFail.Inc(); return; }
 
+        if (g_echoMode)
+        {
+            // 에코 모드는 JOIN 을 건너뛴다 — 붙은 즉시 ACTIVE 로 보고 ECHO 만 주고받는다.
+            // joinOk 는 여기선 「접속 완료 누계」로 쓴다(active 는 종료 때 0 으로 돌아가 게이트에 못 쓴다).
+            c.state = CState::Active;
+            g_stats.active.Inc();
+            g_stats.joinOk.Inc();
+            UpdateWrite(c, idx, !c.pend.empty());
+            return;
+        }
+
         MSG_C2S_JOIN join{};
         join.header.size  = sizeof(join);
         join.header.type  = static_cast<uint16_t>(MsgType::C2S_JOIN);
@@ -250,6 +313,19 @@ void Worker::ParseFrames(Client& c)
 
         switch (static_cast<MsgType>(h.type))
         {
+        case MsgType::ECHO:
+            if (h.size == sizeof(EchoPacket))
+            {
+                EchoPacket e{};
+                std::memcpy(&e, c.recvBuf + off, sizeof(e));
+                const int64_t rttUs = (NowNs() - e.sentNs) / 1000;
+                ++_local.echoRecv;
+                if (rttUs > _local.rttMaxUs) _local.rttMaxUs = rttUs;
+                int rb = 0;
+                while (rb < kRttBuckets - 1 && rttUs > kRttBucketUs[rb]) ++rb;
+                ++_local.rttBuckets[rb];
+            }
+            break;
         case MsgType::S2C_JOIN_OK:
             if (c.state == CState::Joining) { c.state = CState::Active; g_stats.joinOk.Inc(); g_stats.active.Inc(); }
             break;
@@ -357,15 +433,29 @@ void Worker::Loop()
             Client& c = _clients[i];
             if (c.state != CState::Active || workStart < c.nextInputNs)
                 continue;
-            MSG_C2S_INPUT in{};
-            in.header.size = sizeof(in);
-            in.header.type = static_cast<uint16_t>(MsgType::C2S_INPUT);
-            in.seq = ++c.seq;
-            in.mx = 0; in.my = 0; in.attack = 0; in.skill = 0;   // 정지 유지 — 출구 발동 방지
-            SendBytes(c, &in, sizeof(in));
-            if (c.state == CState::Dead) continue;
-            if (!c.pend.empty()) UpdateWrite(c, i, true);
-            ++_local.inputs;
+            if (g_echoMode)
+            {
+                EchoPacket e{};
+                e.header.size = sizeof(e);
+                e.header.type = static_cast<uint16_t>(MsgType::ECHO);
+                e.sentNs      = NowNs();
+                SendBytes(c, &e, sizeof(e));
+                if (c.state == CState::Dead) continue;
+                if (!c.pend.empty()) UpdateWrite(c, i, true);
+                ++_local.echoSent;
+            }
+            else
+            {
+                MSG_C2S_INPUT in{};
+                in.header.size = sizeof(in);
+                in.header.type = static_cast<uint16_t>(MsgType::C2S_INPUT);
+                in.seq = ++c.seq;
+                in.mx = 0; in.my = 0; in.attack = 0; in.skill = 0;   // 정지 유지 — 출구 발동 방지
+                SendBytes(c, &in, sizeof(in));
+                if (c.state == CState::Dead) continue;
+                if (!c.pend.empty()) UpdateWrite(c, i, true);
+                ++_local.inputs;
+            }
             c.nextInputNs = (c.nextInputNs == 0 ? workStart : c.nextInputNs) + inputPeriodNs;
         }
 
@@ -413,6 +503,7 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--run-secs") && i + 1 < argc) runSecs = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--ramp") && i + 1 < argc) ramp = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--metrics-port") && i + 1 < argc) mport = static_cast<uint16_t>(std::atoi(argv[++i]));
+        else if (!std::strcmp(argv[i], "--mode") && i + 1 < argc) g_echoMode = (std::strcmp(argv[++i], "echo") == 0);
     }
     if (threads <= 0)
         threads = (sessions + 1499) / 1500;      // MMO 유효성 경계(1,800/스레드) 아래로
@@ -422,8 +513,9 @@ int main(int argc, char** argv)
     metrics::Server ms;
     ms.Start(mport, &BuildDummyText);
 
-    std::printf("belt_dummy: %s:%u sessions %d / threads %d / input %dHz / %ds\n",
-                host, static_cast<unsigned>(port), sessions, threads, inputHz, runSecs);
+    std::printf("belt_dummy: %s:%u sessions %d / threads %d / %s %dHz / %ds\n",
+                host, static_cast<unsigned>(port), sessions, threads,
+                g_echoMode ? "echo" : "input", inputHz, runSecs);
 
     const int64_t deadline = NowNs() + static_cast<int64_t>(runSecs) * 1000000000;
     std::vector<std::unique_ptr<Worker>> workers;
@@ -438,22 +530,47 @@ int main(int argc, char** argv)
     ms.Stop();
 
     // ── 자가 판정 (게이트) ──
-    const int64_t joined = g_stats.joinOk.Load();
+    // 히스토그램에서 p99 이 걸리는 버킷 상한을 돌려준다 (-1 = 최상단 초과 또는 표본 없음)
+    auto p99Of = [](const Counter* buckets, const int64_t* edges, int n) -> int64_t {
+        int64_t cum = 0;
+        std::vector<int64_t> bucketCum(static_cast<size_t>(n));
+        for (int b = 0; b < n; ++b) { cum += buckets[b].Load(); bucketCum[static_cast<size_t>(b)] = cum; }
+        if (cum == 0) return -1;
+        const int64_t target = (cum * 99 + 99) / 100;
+        for (int b = 0; b < n; ++b)
+            if (bucketCum[static_cast<size_t>(b)] >= target)
+                return (b < n - 1) ? edges[b] : -1;
+        return -1;
+    };
+
+    const int64_t joined  = g_stats.joinOk.Load();     // 에코 모드에선 「접속 완료 누계」
     const int64_t bufFull = g_stats.pendOverflow.Load();
-    const int64_t closed = g_stats.serverClosed.Load();
-    int64_t cum = 0, total = 0;
-    int64_t bucketCum[kLoopBuckets];
-    for (int b = 0; b < kLoopBuckets; ++b) { cum += g_stats.loopBucket[b].Load(); bucketCum[b] = cum; }
-    total = cum;
-    int64_t p99Le = -1;
-    if (total > 0)
+    const int64_t closed  = g_stats.serverClosed.Load();
+    const int64_t p99Le   = p99Of(g_stats.loopBucket, kLoopBucketUs, kLoopBuckets);
+    const bool    loopOk  = p99Le > 0 && p99Le <= 40000;
+
+    if (g_echoMode)
     {
-        const int64_t target = (total * 99 + 99) / 100;
-        for (int b = 0; b < kLoopBuckets; ++b)
-            if (bucketCum[b] >= target) { p99Le = (b < kLoopBuckets - 1) ? kLoopBucketUs[b] : -1; break; }
+        const int64_t sent   = g_stats.echoSent.Load();
+        const int64_t recv   = g_stats.echoRecv.Load();
+        const int64_t rttP99 = p99Of(g_stats.rttBucket, kRttBucketUs, kRttBuckets);
+        // 마지막 왕복은 아직 오는 중일 수 있다 — 세션당 1개까지만 봐준다
+        const bool ok = joined == sessions && recv >= sent - sessions &&
+                        bufFull == 0 && closed == 0 && loopOk;
+        std::printf("belt_dummy: connected %lld/%d, echo %lld sent / %lld recv (%lld 미도착), "
+                    "rtt p99<=%lldus max %lldus, bufFull %lld, serverClosed %lld, "
+                    "loop p99<=%lldus max %lldus — %s\n",
+                    static_cast<long long>(joined), sessions,
+                    static_cast<long long>(sent), static_cast<long long>(recv),
+                    static_cast<long long>(sent - recv),
+                    static_cast<long long>(rttP99), static_cast<long long>(g_stats.rttMaxUs.Load()),
+                    static_cast<long long>(bufFull), static_cast<long long>(closed),
+                    static_cast<long long>(p99Le), static_cast<long long>(g_stats.loopMaxUs.Load()),
+                    ok ? "GATE OK" : "GATE FAIL");
+        return ok ? 0 : 1;
     }
-    const bool ok = joined == sessions && bufFull == 0 && closed == 0 &&
-                    p99Le > 0 && p99Le <= 40000;
+
+    const bool ok = joined == sessions && bufFull == 0 && closed == 0 && loopOk;
     std::printf("belt_dummy: joined %lld/%d, snapshots %lld, inputs %lld, "
                 "bufFull %lld, serverClosed %lld, loop p99<=%lldus max %lldus — %s\n",
                 static_cast<long long>(joined), sessions,
