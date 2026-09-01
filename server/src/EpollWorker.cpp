@@ -255,7 +255,14 @@ void EpollWorker::ParseFrames(Session& s)
             return;
         }
         if (s.recvQ.GetDataSize() < h.size)
-            return;      // 아직 덜 왔다
+        {
+            metrics::g.frameWait.Inc();   // 부분 수신 — 프레임이 쪼개져 도착했다
+            return;
+        }
+
+        // 랩 경계를 가로질러 꺼내는가 (Dequeue 가 두 토막으로 복사하는 경우)
+        if (s.recvQ.GetDirectReadSize() < h.size)
+            metrics::g.ringSplitRead.Inc();
 
         uint8_t buf[MAX_PACKET_SIZE];
         s.recvQ.Dequeue(buf, h.size);
@@ -365,6 +372,7 @@ void EpollWorker::SendBytes(Session& s, const void* data, size_t len)
     {
         // U1.3 시점의 송신링 가득 = 상대가 안 읽는 것 — 절단.
         // (스냅샷의 drop-oldest 정책은 U2.3에서 스냅샷 경로에만 붙는다)
+        metrics::g.sendRingFull.Inc();
         Disconnect(s);
         return;
     }
@@ -383,6 +391,10 @@ void EpollWorker::FlushSend(Session& s)
             return;
         }
 
+        // 랩에 걸리면 이번엔 끝까지 못 내보낸다 — 경계를 실제로 지났다는 표식
+        if (si.directReadSize < si.dataSize)
+            metrics::g.ringSplitSend.Inc();
+
         const ssize_t n = ::write(s.fd, si.readPtr, si.directReadSize);
         if (n > 0)
         {
@@ -390,6 +402,7 @@ void EpollWorker::FlushSend(Session& s)
             metrics::g.sendBytes.Add(n);
             if (static_cast<size_t>(n) < si.directReadSize)
             {
+                metrics::g.partialSend.Inc();
                 UpdateWriteInterest(s, true);      // 커널 버퍼가 찼다 — 나머지는 EPOLLOUT 뒤에
                 return;
             }
@@ -416,7 +429,11 @@ void EpollWorker::UpdateWriteInterest(Session& s, bool want)
     ev.events   = EPOLLIN | EPOLLRDHUP | (want ? EPOLLOUT : 0u);
     ev.data.u64 = PackTag(s.idx, s.gen);
     if (::epoll_ctl(_epfd, EPOLL_CTL_MOD, s.fd, &ev) == 0)
+    {
         s.wantWrite = want;
+        if (want)
+            metrics::g.epolloutArm.Inc();      // 보류 경로에 실제로 들어갔다
+    }
 }
 
 void EpollWorker::Disconnect(Session& s)

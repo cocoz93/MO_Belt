@@ -66,6 +66,13 @@ std::string BuildText()
     put("belt_sessions_active", g.accepts.Load() - g.disconnects.Load());   // 파생 게이지 — 누수 판독용
     put("belt_recv_bytes_total", g.recvBytes.Load());
     put("belt_send_bytes_total", g.sendBytes.Load());
+    // 경로 계측 — 0 이면 그 경로는 이번 런에서 밟히지 않은 것(검증되지 않았다는 뜻)
+    put("belt_ring_split_read_total", g.ringSplitRead.Load());
+    put("belt_ring_split_send_total", g.ringSplitSend.Load());
+    put("belt_partial_send_total",    g.partialSend.Load());
+    put("belt_epollout_arm_total",    g.epolloutArm.Load());
+    put("belt_send_ring_full_total",  g.sendRingFull.Load());
+    put("belt_frame_wait_total",      g.frameWait.Load());
     put("belt_joins_total",     g.joins.Load());
     put("belt_join_fails_total", g.joinFails.Load());
     put("belt_rooms_created_total", g.roomsCreated.Load());

@@ -61,6 +61,14 @@ int  g_overSend      = 0;       // 미응답 허용 윈도우 (0 = 제한 없음
 int  g_echoTimeoutMs = 500;     // 이 시간 넘게 응답이 없으면 echoNotRecv
 int  g_churnMs       = 0;       // >0 이면 [n,5n] 랜덤 시간 뒤 스스로 끊고 재접속
 int  g_reconnectMs   = 1000;    // 끊긴 뒤 다시 붙기까지 대기
+// sendQ 압박 — 앞 N 개 세션이 **받기를 그만두고 계속 보내기만** 한다.
+// 그러면 커널 수신창이 차고 → 서버 write 가 EAGAIN → 보류(EPOLLOUT)·부분 전송·송신링 가득이
+// 차례로 발동한다. 정상 부하로는 이 세 경로가 아예 안 밟혀서(경로 계측 0), 일부러 만든다.
+int  g_attackSendQ   = 0;       // 공격 세션 수 (0 = 끔)
+// 느린 소비자 — >0 이면 공격 세션이 "아예 안 읽는" 대신 이 주기로만 읽는다.
+// 링이 가득 차 절단되기 전에 조금씩 비워주므로, 서버가 보류→재개를 되풀이한다.
+// 완전 무시는 절단 경로를, 이쪽은 보류·부분 전송 경로를 깊게 파는 게 목적이다.
+int  g_slowRecvMs    = 0;
 bool g_failFast      = true;    // 무결성 위반 즉시 중단
 std::atomic<bool> g_stop{false};
 
@@ -247,6 +255,8 @@ struct Client
     bool     notRecvFlagged = false;
     int64_t  churnAtNs     = 0;    // 이 시각에 스스로 끊는다 (0 = 안 끊음)
     int64_t  reconnectAtNs = 0;    // 끊긴 뒤 이 시각에 다시 붙는다 (0 = 안 붙음)
+    bool     attacker      = false;   // sendQ 압박 — 받지 않고 보내기만 한다
+    int64_t  nextRecvNs    = 0;       // 느린 소비자: 이 시각에 한 번 읽는다
 };
 
 constexpr size_t kPendMax = 4096;
@@ -338,6 +348,17 @@ void Worker::StartConnect(size_t idx)
     // 시드는 세션 자리마다 고정(재접속해도 유지) — 워커·자리로 갈라 세션 간 내용이 겹치지 않게 한다.
     if (c.seed == 0)
         c.seed = Mix64((static_cast<uint64_t>(_id) << 32) ^ (idx + 1));
+    // 공격 세션은 워커 0 의 앞자리로 고정 — 나머지는 정상 에코라 비교군이 된다
+    c.attacker = (g_attackSendQ > 0 && _id == 0 && idx < static_cast<size_t>(g_attackSendQ));
+    if (c.attacker && g_slowRecvMs > 0)
+    {
+        // 느린 소비자만 수신창을 좁힌다 — 기본 버퍼(수백 KB)로는 조금씩 읽어도 커널이 다 받아줘서
+        // 서버 송신이 막히질 않는다(30ms 주기 실측: 보류 0).
+        // ⚠ 반대로 "아예 안 읽는" 쪽에 이걸 걸면 우리 송신이 먼저 막혀 서버까지 부하가 안 간다
+        //   (④ 실측: 클라 보류만 넘치고 서버 링가득 0). 그쪽은 넓은 창으로 밀어야 한다.
+        int rb = 4096;
+        ::setsockopt(c.fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
+    }
     c.echoSeq = 0;
     c.expectRecv = 1;
     c.pending = 0;
@@ -382,6 +403,19 @@ void Worker::OnEvent(size_t idx, uint32_t ev)
             c.state = CState::Active;
             g_stats.active.Inc();
             g_stats.joinOk.Inc();
+            // 공격 세션은 여기서 EPOLLIN 을 떼고 다시는 읽지 않는다 — 커널 수신창을 채워
+            // 서버 송신 경로(보류·부분 전송·링 가득)를 밀어붙이는 게 목적이다.
+            if (c.attacker)
+            {
+                epoll_event ea{};
+                ea.events   = EPOLLRDHUP;      // EPOLLIN 없음 = 안 읽는다
+                ea.data.u64 = idx;
+                ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c.fd, &ea);
+                c.wantWrite = false;
+                if (g_slowRecvMs > 0)
+                    c.nextRecvNs = NowNs() + static_cast<int64_t>(g_slowRecvMs) * 1000000;
+                return;
+            }
             UpdateWrite(c, idx, !c.pend.empty());
             return;
         }
@@ -401,7 +435,18 @@ void Worker::OnEvent(size_t idx, uint32_t ev)
         if (c.pend.empty()) UpdateWrite(c, idx, false);
     }
     if (ev & EPOLLIN)
+    {
         OnReadable(idx);
+        // 느린 소비자는 한 번 비우고 다시 귀를 닫는다 — 서버를 다시 보류로 밀어 넣는다
+        if (c.attacker && g_slowRecvMs > 0 && c.state == CState::Active)
+        {
+            epoll_event ea{};
+            ea.events   = EPOLLRDHUP | (c.wantWrite ? EPOLLOUT : 0u);
+            ea.data.u64 = idx;
+            ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c.fd, &ea);
+            c.nextRecvNs = NowNs() + static_cast<int64_t>(g_slowRecvMs) * 1000000;
+        }
+    }
 }
 
 void Worker::OnReadable(size_t idx)
@@ -410,8 +455,20 @@ void Worker::OnReadable(size_t idx)
     for (;;)
     {
         if (c.recvLen == sizeof(c.recvBuf)) { Kill(c, false); return; }   // 파싱 불능 — 방어
-        const ssize_t n = ::read(c.fd, c.recvBuf + c.recvLen, sizeof(c.recvBuf) - c.recvLen);
-        if (n > 0) { c.recvLen += static_cast<size_t>(n); ParseFrames(idx); if (c.state == CState::Dead) return; continue; }
+        // 느린 소비자는 한 번에 한 술만 뜬다 — 커널 수신창이 조금씩만 열려야
+        // 서버 write 가 "일부만 나가는"(부분 전송) 상태에 들어간다.
+        const size_t room = (c.attacker && g_slowRecvMs > 0)
+                            ? (sizeof(c.recvBuf) - c.recvLen < 2048 ? sizeof(c.recvBuf) - c.recvLen : 2048)
+                            : sizeof(c.recvBuf) - c.recvLen;
+        const ssize_t n = ::read(c.fd, c.recvBuf + c.recvLen, room);
+        if (n > 0)
+        {
+            c.recvLen += static_cast<size_t>(n);
+            ParseFrames(idx);
+            if (c.state == CState::Dead) return;
+            if (c.attacker && g_slowRecvMs > 0) return;   // 이번 차례는 여기까지
+            continue;
+        }
         if (n == 0) { Kill(c, true); return; }
         if (errno == EAGAIN || errno == EWOULDBLOCK) return;
         if (errno == EINTR) continue;
@@ -572,7 +629,7 @@ void Worker::UpdateWrite(Client& c, size_t idx, bool want)
     if (c.wantWrite == want || c.fd < 0)
         return;
     epoll_event ev{};
-    ev.events   = EPOLLIN | EPOLLRDHUP | (want ? EPOLLOUT : 0u);
+    ev.events   = (c.attacker ? 0u : EPOLLIN) | EPOLLRDHUP | (want ? EPOLLOUT : 0u);
     ev.data.u64 = idx;
     if (::epoll_ctl(_epfd, EPOLL_CTL_MOD, c.fd, &ev) == 0)
         c.wantWrite = want;
@@ -675,6 +732,25 @@ void Worker::Loop()
                 c.notRecvFlagged = true;
             }
 
+            // 공격 세션은 주기·창 제한을 무시하고 매 루프 민다. 받지를 않으니 미응답은 계속 늘고,
+            // 서버 쪽 송신이 먼저 막힌다(우리 송신은 서버가 계속 읽으므로 안 막힌다).
+            if (g_echoMode && c.attacker)
+            {
+                // 느린 소비자: 읽을 차례가 되면 귀를 잠깐 연다
+                if (g_slowRecvMs > 0 && c.nextRecvNs != 0 && workStart >= c.nextRecvNs)
+                {
+                    epoll_event ea{};
+                    ea.events   = EPOLLIN | EPOLLRDHUP | (c.wantWrite ? EPOLLOUT : 0u);
+                    ea.data.u64 = i;
+                    ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c.fd, &ea);
+                    c.nextRecvNs = 0;      // 다음 수신 뒤 OnEvent 가 다시 잡는다
+                }
+                // 여기서 송신을 조이면 서버가 되돌릴 양이 줄어 정작 링이 안 찬다(④ 실측: 보류 0).
+                // 우리 쪽 보류 넘침은 서버가 이 세션을 끊은 뒤의 잔여 송신이라 게이트에서 따로 면제한다.
+                SendEcho(c, i);
+                continue;
+            }
+
             if (workStart < c.nextInputNs)
                 continue;
 
@@ -757,6 +833,8 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--churn-ms") && i + 1 < argc) g_churnMs = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--reconnect-ms") && i + 1 < argc) g_reconnectMs = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--fail-fast") && i + 1 < argc) g_failFast = std::atoi(argv[++i]) != 0;
+        else if (!std::strcmp(argv[i], "--attack-sendq") && i + 1 < argc) g_attackSendQ = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--slow-recv-ms") && i + 1 < argc) g_slowRecvMs = std::atoi(argv[++i]);
     }
 
     // 크기 범위 정리 — 머리 20B 미만이면 검증 자체가 성립 안 하고, 서버 상한을 넘으면 서버가 끊는다
@@ -819,16 +897,26 @@ int main(int argc, char** argv)
         const int64_t ordErr = g_stats.orderError.Load();
         const int64_t rttP99 = p99Of(g_stats.rttBucket, kRttBucketUs, kRttBuckets);
 
-        // churn 을 켜면 세션이 오가므로 접속 누계·서버발 끊김은 게이트에서 뺀다
-        const bool churning  = g_churnMs > 0;
+        // churn 을 켜면 세션이 오가므로 접속 누계·서버발 끊김은 게이트에서 뺀다.
+        // sendQ 압박은 "서버가 그 세션을 끊는 것"이 기대 동작이라 마찬가지로 뺀다
+        // (끊지 않으면 방어가 안 도는 것이므로 아래에서 따로 본다).
+        const bool churning  = g_churnMs > 0 || g_attackSendQ > 0;
         const bool connectOk = churning ? (joined >= sessions) : (joined == sessions);
         const bool closeOk   = churning ? true : (closed == 0);
         // 마지막 왕복은 아직 오는 중일 수 있다 — 세션당 1개까지만 봐준다.
         // 과부하 창을 열어두면 미응답이 그만큼 더 남으므로 상한도 그만큼 넓힌다.
         const int64_t inflightAllow = static_cast<int64_t>(sessions) *
                                       (g_overSend > 0 ? g_overSend : 1);
-        const bool ok = connectOk && closeOk && recv >= sent - inflightAllow &&
-                        padErr == 0 && ordErr == 0 && bufFull == 0 && loopOk;
+        // 공격 세션은 애초에 받지를 않으니 미도착 검사는 뜻이 없다. 대신 서버가 끊었는지를 본다 —
+        // 안 끊으면 송신링 방어가 안 도는 것이라 그게 실패다.
+        const bool inflightOk = (g_attackSendQ > 0) || (recv >= sent - inflightAllow);
+        // 완전히 안 읽는 공격이면 서버가 끊어야 정상. 느린 소비자는 끊길 이유가 없으므로 요구하지 않는다.
+        const bool attackOk   = (g_attackSendQ == 0) || (g_slowRecvMs > 0) || (closed > 0);
+        // 공격 런에서는 서버가 그 세션을 끊은 뒤에도 우리가 밀던 게 남아 보류가 넘칠 수 있다 —
+        // 그건 더미가 포화한 게 아니라 절단의 뒷정리라 면제한다.
+        const bool bufOk = (g_attackSendQ > 0) || (bufFull == 0);
+        const bool ok = connectOk && closeOk && inflightOk && attackOk &&
+                        padErr == 0 && ordErr == 0 && bufOk && loopOk;
 
         std::printf("belt_dummy: connected %lld/%d, echo %lld sent / %lld recv (%lld 미도착), "
                     "padErr %lld, orderErr %lld, late %lld, notRecv %lld, reconnect %lld, "

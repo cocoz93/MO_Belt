@@ -67,6 +67,16 @@ struct Counters
     Counter recvBytes;
     Counter sendBytes;
 
+    // ── 경로 계측 ──
+    // "무결성 위반 0" 은 그 코드 길을 지나고도 멀쩡했다는 뜻일 때만 값이 있다.
+    // 아래가 0 인 런은 그 경로에 대해 아무것도 증명하지 못한 것으로 읽어야 한다.
+    Counter ringSplitRead;     // 링 랩 경계를 가로질러 읽음 (수신 프레임/송신 덩어리)
+    Counter ringSplitSend;     // 송신 링이 랩에 걸려 한 번에 다 못 내보냄
+    Counter partialSend;       // write 가 요청보다 적게 나감 — 커널 버퍼 포화
+    Counter epolloutArm;       // EPOLLOUT 등록 = 송신 보류 시작
+    Counter sendRingFull;      // 송신 링 가득 (넣을 자리 없음)
+    Counter frameWait;         // 프레임이 덜 와서 다음 read 를 기다림 (부분 수신)
+
     Counter joins;
     Counter joinFails;
     Counter roomsCreated;
