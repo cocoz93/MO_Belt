@@ -349,8 +349,11 @@ void Worker::StartConnect(size_t idx)
     // 시드는 세션 자리마다 고정(재접속해도 유지) — 워커·자리로 갈라 세션 간 내용이 겹치지 않게 한다.
     if (c.seed == 0)
         c.seed = Mix64((static_cast<uint64_t>(_id) << 32) ^ (idx + 1));
-    // 공격 세션은 워커 0 의 앞자리로 고정 — 나머지는 정상 에코라 비교군이 된다
-    c.attacker = (g_attackSendQ > 0 && _id == 0 && idx < static_cast<size_t>(g_attackSendQ));
+    // 공격 세션은 워커 0 의 앞자리로 고정 — 나머지는 정상 에코라 비교군이 된다.
+    // g_echoMode 를 함께 보는 이유: attacker 는 UpdateWrite 의 EPOLLIN 여부까지 바꾸는 공용 경로라,
+    // 게임 모드에서 이 인자가 들어오면 그 세션이 스냅샷을 못 받는다.
+    c.attacker = (g_echoMode && g_attackSendQ > 0 && _id == 0 &&
+                  idx < static_cast<size_t>(g_attackSendQ));
     if (c.attacker && g_slowRecvMs > 0)
     {
         // 느린 소비자만 수신창을 좁힌다 — 기본 버퍼(수백 KB)로는 조금씩 읽어도 커널이 다 받아줘서
