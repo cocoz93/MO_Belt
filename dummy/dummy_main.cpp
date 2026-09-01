@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -836,6 +837,9 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--attack-sendq") && i + 1 < argc) g_attackSendQ = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--slow-recv-ms") && i + 1 < argc) g_slowRecvMs = std::atoi(argv[++i]);
     }
+
+    // 서버가 끊은 소켓에 마저 쓰다 SIGPIPE 로 죽으면 그 런 전체가 무효다 — 서버와 같은 처리를 한다
+    ::signal(SIGPIPE, SIG_IGN);
 
     // 크기 범위 정리 — 머리 20B 미만이면 검증 자체가 성립 안 하고, 서버 상한을 넘으면 서버가 끊는다
     if (g_pktMin < static_cast<int>(kEchoMin)) g_pktMin = static_cast<int>(kEchoMin);

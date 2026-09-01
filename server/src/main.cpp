@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +17,16 @@
 #include "SelfTest.h"
 
 namespace {
+
+// 끊긴 소켓에 write 하면 SIGPIPE 가 날아오고, 기본 동작이 프로세스 종료라 서버가 통째로 죽는다.
+// 무시로 바꾸면 write 가 EPIPE 를 돌려주고 기존 절단 경로로 흘러간다.
+// ⚠ 이 함정은 MMO 리눅스 포팅에서 이미 겪은 것(Platform.h 의 같은 처리)인데 여기선 빠져 있었다.
+//   재접속이 잦아야 "닫힌 소켓에 쓰는" 순간이 생겨서, 재접속 없는 런에서는 끝내 안 드러났다
+//   — 2,000세션에 5초 churn 을 걸자 두 번 다 2분 남짓에 죽었다(종료 코드 141 = 128+SIGPIPE).
+void IgnoreSigPipe()
+{
+    ::signal(SIGPIPE, SIG_IGN);
+}
 
 // WSL2 기본 soft 한도는 1024 — 세션 수천이면 accept 1천대에서 즉사한다. hard 까지 올린다.
 bool RaiseFdLimit(rlim_t want)
@@ -73,6 +84,8 @@ int main(int argc, char** argv)
 
     if (selftest)
         return RunSelfTest();
+
+    IgnoreSigPipe();
 
     if (!RaiseFdLimit(8192))
     {
