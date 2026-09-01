@@ -10,9 +10,12 @@
 //
 //   모드 둘:
 //     --mode game (기본) : JOIN → 60Hz 입력 → 스냅샷 소비. 게임까지 포함한 부하.
-//     --mode echo        : JOIN 없이 ECHO 만 60Hz 로 왕복. 서버를 `--game 0` 으로 띄워
-//                          전송 계층만 남긴 뒤 재는 기준선용(설계 §12 의 계층 분리).
-//                          ECHO 는 INPUT 과 같은 12B 라 전송량이 같고, 왕복 지연도 같이 잰다.
+//     --mode echo        : JOIN 없이 ECHO 만 왕복. 서버를 `--game 0` 으로 띄워 전송 계층만
+//                          남긴 뒤 ⓐ 얼마나 빠른가(지연·CPU) ⓑ 제대로 오는가(무결성)를 함께 본다.
+//                          무결성은 패킷 크기와 패딩을 **seq 에서 결정적으로 뽑아** 되받은 것과
+//                          대조하는 식이다 — 바이트 훼손·크기 변조·순서 역전이 전부 여기서 걸린다.
+//                          개수만 세는 지표(dropped 0 따위)로는 내용이 맞는지 알 수 없어서 넣었다.
+//                          ⚠ 검증기 자체가 눈뜬장님이 아닌지는 tools/echo-faultcheck.sh 로 확인한다.
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -28,6 +31,7 @@
 #include <cstring>
 #include <ctime>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -49,16 +53,82 @@ constexpr int     kRttBuckets    = 10;
 
 // 에코 모드 — 게임 워커를 끈 서버(`--game 0`)에 붙어 전송 계층만 재는 기준선용.
 // JOIN 을 하지 않으므로 방·틱·스냅샷이 개입하지 않는다.
-bool g_echoMode = false;
+bool g_echoMode      = false;
+bool g_verify        = true;    // 값·크기·패딩 대조 (끄면 지연만 재는 옛 동작)
+int  g_pktMin        = 20;      // 에코 패킷 크기 범위 [min,max] — 두 값이 같으면 고정 크기
+int  g_pktMax        = 256;     //   서버 MAX_PACKET_SIZE 는 1024 라 그 아래로 잡아야 한다
+int  g_overSend      = 0;       // 미응답 허용 윈도우 (0 = 제한 없음 — 주기대로 계속 보냄)
+int  g_echoTimeoutMs = 500;     // 이 시간 넘게 응답이 없으면 echoNotRecv
+int  g_churnMs       = 0;       // >0 이면 [n,5n] 랜덤 시간 뒤 스스로 끊고 재접속
+int  g_reconnectMs   = 1000;    // 끊긴 뒤 다시 붙기까지 대기
+bool g_failFast      = true;    // 무결성 위반 즉시 중단
+std::atomic<bool> g_stop{false};
 
+// ── 에코 패킷 규격 ──
+//   [헤더 4B][seq 8B][보낸시각 8B][패딩 0~N]  — 최소 20B
+//   크기와 패딩을 **둘 다 seq 에서 결정적으로 뽑는다**. 그래서 받은 쪽은 "이 seq 는 원래
+//   몇 바이트에 어떤 내용이어야 하는가"를 다시 만들어 대조할 수 있다 —
+//   크기 변조·바이트 훼손·순서 역전이 전부 여기서 걸린다.
 #pragma pack(push, 1)
-struct EchoPacket
+struct EchoHead
 {
     MsgHeader header;
-    int64_t   sentNs;    // 왕복 지연용 — 서버는 내용을 보지 않고 그대로 되돌린다
+    uint64_t  seq;       // 세션마다 1 부터 증가
+    int64_t   sentNs;    // 왕복 지연용
 };
 #pragma pack(pop)
-static_assert(sizeof(EchoPacket) == 12, "ECHO 는 INPUT(12B) 과 같은 크기 — 전송량을 맞춰야 비교가 선다");
+static_assert(sizeof(EchoHead) == 20, "ECHO 머리 20B");
+constexpr size_t kEchoMin = sizeof(EchoHead);
+
+// splitmix64 — 시드 하나에서 되풀이 가능한 값을 뽑는다(표준 난수기는 구현마다 달라 못 쓴다)
+uint64_t Mix64(uint64_t x)
+{
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+// seq → 이 패킷의 전체 크기
+uint16_t EchoSizeFor(uint64_t seed, uint64_t seq)
+{
+    if (g_pktMax <= g_pktMin)
+        return static_cast<uint16_t>(g_pktMin);
+    const uint64_t span = static_cast<uint64_t>(g_pktMax - g_pktMin + 1);
+    return static_cast<uint16_t>(g_pktMin + Mix64(seed ^ (seq * 0xD1B54A32D192ED03ULL)) % span);
+}
+
+// seq → 패딩 내용 (머리 20B 뒤를 채운다)
+void FillPad(uint8_t* p, size_t n, uint64_t seed, uint64_t seq)
+{
+    uint64_t s = seed ^ seq;
+    for (size_t i = 0; i < n; i += 8)
+    {
+        s = Mix64(s);
+        const size_t chunk = (n - i < 8) ? (n - i) : 8;
+        std::memcpy(p + i, &s, chunk);
+    }
+}
+
+// ── 무결성 위반 덤프 — 카운터만으로는 어느 세션의 몇 바이트가 틀렸는지 못 쫓는다 ──
+std::mutex g_dumpLock;
+int        g_dumpCount = 0;
+const char* kDumpPath = "/tmp/belt-echo-integrity.log";
+
+void DumpViolation(const char* kind, int worker, size_t idx, uint64_t seq,
+                   const char* detail)
+{
+    std::lock_guard<std::mutex> lk(g_dumpLock);
+    if (g_dumpCount >= 8)
+        return;
+    ++g_dumpCount;
+    FILE* f = std::fopen(kDumpPath, "a");
+    if (!f)
+        return;
+    std::fprintf(f, "[%s] worker=%d client=%zu seq=%llu %s\n",
+                 kind, worker, idx, static_cast<unsigned long long>(seq), detail);
+    std::fclose(f);
+}
 
 struct DummyStats
 {
@@ -73,10 +143,15 @@ struct DummyStats
     Counter loops;
     Counter loopBucket[kLoopBuckets];
     Counter loopMaxUs;
-    Counter echoSent;        // 아래 셋은 에코 모드 전용
+    Counter echoSent;        // 아래는 에코 모드 전용
     Counter echoRecv;
     Counter rttBucket[kRttBuckets];
     Counter rttMaxUs;
+    Counter padError;        // payload 훼손 — 링버퍼 랩·코얼레싱·부분전송 경계 결함 신호. 반드시 0
+    Counter orderError;      // 기대보다 큰 seq 도착 = 건너뜀(유실·뒤섞임). 반드시 0
+    Counter lateArrival;     // 기대보다 작은 seq — 타임아웃 뒤 뒤늦게 도착
+    Counter echoNotRecv;     // 미응답이 echoTimeoutMs 를 넘긴 세션 수
+    Counter reconnects;      // churn 재접속 횟수
 };
 DummyStats g_stats;
 
@@ -122,6 +197,13 @@ std::string BuildDummyText()
     {
         put("dummy_echo_sent_total", g_stats.echoSent.Load());
         put("dummy_echo_recv_total", g_stats.echoRecv.Load());
+        put("dummy_pad_error_total",   g_stats.padError.Load());
+        put("dummy_order_error_total", g_stats.orderError.Load());
+        put("dummy_packet_error_total", g_stats.padError.Load() + g_stats.orderError.Load());
+        put("dummy_late_arrival_total", g_stats.lateArrival.Load());
+        put("dummy_echo_not_recv_total", g_stats.echoNotRecv.Load());
+        put("dummy_reconnects_total",  g_stats.reconnects.Load());
+        put("dummy_pending_packets",   g_stats.echoSent.Load() - g_stats.echoRecv.Load());
         put("dummy_rtt_max_us",      g_stats.rttMaxUs.Load());
         int64_t rcum = 0;
         for (int b = 0; b < kRttBuckets; ++b)
@@ -149,9 +231,22 @@ struct Client
     uint32_t seq = 0;
     int64_t  nextInputNs = 0;
     size_t   recvLen = 0;
-    uint8_t  recvBuf[512];
+    // 가변 크기(최대 1024) + 코얼레싱으로 여러 장이 한 번에 오므로 512 로는 모자란다
+    uint8_t  recvBuf[4096];
     std::vector<uint8_t> pend;     // write 가 EAGAIN 일 때의 보류분 (상한 넘으면 게이트 위반)
     bool     wantWrite = false;
+
+    // ── 에코 검증 ──
+    uint64_t echoSeq    = 0;       // 다음에 보낼 값 (1 부터)
+    uint64_t expectRecv = 1;       // 다음에 받을 값
+    uint64_t seed       = 0;       // 세션 고유 — 크기·패딩 시드
+    int      pending    = 0;       // 미응답 개수
+    // 마지막으로 응답이 온 시각. 미응답이 쌓인 채로 이 시각에서 echoTimeoutMs 가 지나면 미응답 판정.
+    // (MMO 도구는 송신 시각 deque 로 개별 추적하지만, 여기선 "응답이 끊긴 지 얼마나 됐나"면 충분하다)
+    int64_t  lastRecvNs = 0;
+    bool     notRecvFlagged = false;
+    int64_t  churnAtNs     = 0;    // 이 시각에 스스로 끊는다 (0 = 안 끊음)
+    int64_t  reconnectAtNs = 0;    // 끊긴 뒤 이 시각에 다시 붙는다 (0 = 안 붙음)
 };
 
 constexpr size_t kPendMax = 4096;
@@ -174,8 +269,9 @@ private:
     void Loop();
     void StartConnect(size_t idx);
     void OnEvent(size_t idx, uint32_t ev);
-    void OnReadable(Client& c);
-    void ParseFrames(Client& c);
+    void OnReadable(size_t idx);
+    void ParseFrames(size_t idx);
+    void SendEcho(Client& c, size_t idx);
     void SendBytes(Client& c, const void* data, size_t len);
     void FlushPend(Client& c);
     void UpdateWrite(Client& c, size_t idx, bool want);
@@ -238,6 +334,27 @@ void Worker::StartConnect(size_t idx)
     }
     c.state = CState::Connecting;
 
+    // 에코 검증 상태 초기화 — 재접속이면 서버 쪽 세션도 새것이라 seq 를 1 부터 다시 센다.
+    // 시드는 세션 자리마다 고정(재접속해도 유지) — 워커·자리로 갈라 세션 간 내용이 겹치지 않게 한다.
+    if (c.seed == 0)
+        c.seed = Mix64((static_cast<uint64_t>(_id) << 32) ^ (idx + 1));
+    c.echoSeq = 0;
+    c.expectRecv = 1;
+    c.pending = 0;
+    c.lastRecvNs = NowNs();
+    c.notRecvFlagged = false;
+    c.recvLen = 0;
+    c.pend.clear();
+    c.reconnectAtNs = 0;
+    c.churnAtNs = 0;
+    if (g_churnMs > 0)
+    {
+        // 접속 유지 시간 = [churnMs, 5×churnMs] 랜덤
+        const uint64_t span = static_cast<uint64_t>(g_churnMs) * 4 + 1;
+        const int64_t hold = g_churnMs + static_cast<int64_t>(Mix64(c.seed + c.echoSeq + static_cast<uint64_t>(NowNs())) % span);
+        c.churnAtNs = NowNs() + hold * 1000000;
+    }
+
     epoll_event ev{};
     ev.events   = EPOLLIN | EPOLLOUT | EPOLLRDHUP;   // OUT = 접속 완료 신호
     ev.data.u64 = idx;
@@ -284,16 +401,17 @@ void Worker::OnEvent(size_t idx, uint32_t ev)
         if (c.pend.empty()) UpdateWrite(c, idx, false);
     }
     if (ev & EPOLLIN)
-        OnReadable(c);
+        OnReadable(idx);
 }
 
-void Worker::OnReadable(Client& c)
+void Worker::OnReadable(size_t idx)
 {
+    Client& c = _clients[idx];
     for (;;)
     {
         if (c.recvLen == sizeof(c.recvBuf)) { Kill(c, false); return; }   // 파싱 불능 — 방어
         const ssize_t n = ::read(c.fd, c.recvBuf + c.recvLen, sizeof(c.recvBuf) - c.recvLen);
-        if (n > 0) { c.recvLen += static_cast<size_t>(n); ParseFrames(c); if (c.state == CState::Dead) return; continue; }
+        if (n > 0) { c.recvLen += static_cast<size_t>(n); ParseFrames(idx); if (c.state == CState::Dead) return; continue; }
         if (n == 0) { Kill(c, true); return; }
         if (errno == EAGAIN || errno == EWOULDBLOCK) return;
         if (errno == EINTR) continue;
@@ -301,8 +419,9 @@ void Worker::OnReadable(Client& c)
     }
 }
 
-void Worker::ParseFrames(Client& c)
+void Worker::ParseFrames(size_t idx)
 {
+    Client& c = _clients[idx];
     size_t off = 0;
     while (c.recvLen - off >= sizeof(MsgHeader))
     {
@@ -314,18 +433,89 @@ void Worker::ParseFrames(Client& c)
         switch (static_cast<MsgType>(h.type))
         {
         case MsgType::ECHO:
-            if (h.size == sizeof(EchoPacket))
+        {
+            char det[160];
+            if (h.size < kEchoMin)
             {
-                EchoPacket e{};
-                std::memcpy(&e, c.recvBuf + off, sizeof(e));
-                const int64_t rttUs = (NowNs() - e.sentNs) / 1000;
-                ++_local.echoRecv;
-                if (rttUs > _local.rttMaxUs) _local.rttMaxUs = rttUs;
-                int rb = 0;
-                while (rb < kRttBuckets - 1 && rttUs > kRttBucketUs[rb]) ++rb;
-                ++_local.rttBuckets[rb];
+                g_stats.padError.Inc();
+                std::snprintf(det, sizeof(det), "머리보다 짧다: size=%u (최소 %zu)",
+                              static_cast<unsigned>(h.size), kEchoMin);
+                DumpViolation("SIZE", _id, idx, 0, det);
+                if (g_failFast) g_stop.store(true, std::memory_order_relaxed);
+                Kill(c, false);
+                return;
+            }
+            EchoHead eh{};
+            std::memcpy(&eh, c.recvBuf + off, sizeof(eh));
+
+            // 지연은 대조 결과와 무관하게 기록한다 — 무결성과 지연은 따로 봐야 한다
+            const int64_t now   = NowNs();
+            const int64_t rttUs = (now - eh.sentNs) / 1000;
+            ++_local.echoRecv;
+            if (rttUs > _local.rttMaxUs) _local.rttMaxUs = rttUs;
+            int rb = 0;
+            while (rb < kRttBuckets - 1 && rttUs > kRttBucketUs[rb]) ++rb;
+            ++_local.rttBuckets[rb];
+            if (c.pending > 0) --c.pending;
+            c.lastRecvNs = now;
+            c.notRecvFlagged = false;
+
+            if (g_verify)
+            {
+                // ① 크기 — 이 seq 는 원래 몇 바이트여야 하는가
+                const uint16_t want = EchoSizeFor(c.seed, eh.seq);
+                if (want != h.size)
+                {
+                    g_stats.padError.Inc();
+                    std::snprintf(det, sizeof(det), "크기 불일치: 기대 %u, 실제 %u",
+                                  static_cast<unsigned>(want), static_cast<unsigned>(h.size));
+                    DumpViolation("SIZE", _id, idx, eh.seq, det);
+                    if (g_failFast) g_stop.store(true, std::memory_order_relaxed);
+                }
+                else if (h.size > kEchoMin)
+                {
+                    // ② 패딩 — 같은 시드로 다시 만들어 바이트째 대조
+                    const size_t   padLen = h.size - kEchoMin;
+                    const uint8_t* got    = c.recvBuf + off + kEchoMin;
+                    uint8_t expect[MAX_PACKET_SIZE];
+                    FillPad(expect, padLen, c.seed, eh.seq);
+                    if (std::memcmp(expect, got, padLen) != 0)
+                    {
+                        size_t bad = 0;
+                        while (bad < padLen && expect[bad] == got[bad]) ++bad;
+                        g_stats.padError.Inc();
+                        std::snprintf(det, sizeof(det),
+                                      "패딩 훼손: size=%u 패딩 %zuB 중 오프셋 %zu 부터 (기대 0x%02X, 실제 0x%02X)",
+                                      static_cast<unsigned>(h.size), padLen, bad,
+                                      expect[bad], got[bad]);
+                        DumpViolation("PAD", _id, idx, eh.seq, det);
+                        if (g_failFast) g_stop.store(true, std::memory_order_relaxed);
+                    }
+                }
+
+                // ③ 순서 — 건너뛴 값이 오면 유실·뒤섞임
+                if (eh.seq == c.expectRecv)
+                {
+                    ++c.expectRecv;
+                }
+                else if (eh.seq < c.expectRecv)
+                {
+                    g_stats.lateArrival.Inc();
+                }
+                else
+                {
+                    g_stats.orderError.Inc();
+                    std::snprintf(det, sizeof(det), "순서 역전: 기대 %llu, 실제 %llu (%llu 개 건너뜀)",
+                                  static_cast<unsigned long long>(c.expectRecv),
+                                  static_cast<unsigned long long>(eh.seq),
+                                  static_cast<unsigned long long>(eh.seq - c.expectRecv));
+                    DumpViolation("ORDER", _id, idx, eh.seq, det);
+                    if (g_failFast) g_stop.store(true, std::memory_order_relaxed);
+                    c.expectRecv = eh.seq + 1;
+                }
             }
             break;
+        }
         case MsgType::S2C_JOIN_OK:
             if (c.state == CState::Joining) { c.state = CState::Active; g_stats.joinOk.Inc(); g_stats.active.Inc(); }
             break;
@@ -398,6 +588,33 @@ void Worker::Kill(Client& c, bool byServer)
         g_stats.serverClosed.Inc();
     if (c.fd >= 0) { ::epoll_ctl(_epfd, EPOLL_CTL_DEL, c.fd, nullptr); ::close(c.fd); c.fd = -1; }
     c.state = CState::Dead;
+    // churn 모드면 서버가 끊었든 스스로 끊었든 다시 붙는다 (세션 수명 관리를 부하 중에 때린다)
+    if (g_churnMs > 0)
+        c.reconnectAtNs = NowNs() + static_cast<int64_t>(g_reconnectMs) * 1000000;
+}
+
+void Worker::SendEcho(Client& c, size_t idx)
+{
+    const uint64_t seq  = ++c.echoSeq;
+    const uint16_t size = EchoSizeFor(c.seed, seq);
+
+    uint8_t  buf[MAX_PACKET_SIZE];
+    EchoHead eh{};
+    eh.header.size = size;
+    eh.header.type = static_cast<uint16_t>(MsgType::ECHO);
+    eh.seq         = seq;
+    eh.sentNs      = NowNs();
+    std::memcpy(buf, &eh, sizeof(eh));
+    if (size > kEchoMin)
+        FillPad(buf + kEchoMin, size - kEchoMin, c.seed, seq);
+
+    SendBytes(c, buf, size);
+    if (c.state == CState::Dead)
+        return;
+    if (!c.pend.empty())
+        UpdateWrite(c, idx, true);
+    ++_local.echoSent;
+    ++c.pending;
 }
 
 void Worker::Loop()
@@ -414,7 +631,8 @@ void Worker::Loop()
     for (;;)
     {
         const int64_t loopStart = NowNs();
-        if (loopStart >= _deadline)
+        // 무결성 위반이 나면 즉시 멈춘다 — 더 돌려봐야 증거만 덮이고, 그 뒤 수치는 이미 못 믿는다
+        if (loopStart >= _deadline || g_stop.load(std::memory_order_relaxed))
             break;
 
         // ramp: 루프당 R 개씩 접속 시작
@@ -427,22 +645,49 @@ void Worker::Loop()
         for (int i = 0; i < n; ++i)
             OnEvent(static_cast<size_t>(events[i].data.u64), events[i].events);
 
-        // 유지 입력 — ACTIVE 클라, 주기 도래분만
+        // 유지 송신 + 검증 상태 관리 — ACTIVE 클라, 주기 도래분만
         for (size_t i = 0; i < _clients.size(); ++i)
         {
             Client& c = _clients[i];
-            if (c.state != CState::Active || workStart < c.nextInputNs)
+
+            // 끊긴 세션 되살리기 (churn)
+            if (c.state == CState::Dead && c.reconnectAtNs != 0 && workStart >= c.reconnectAtNs)
+            {
+                StartConnect(i);
+                g_stats.reconnects.Inc();
                 continue;
+            }
+            if (c.state != CState::Active)
+                continue;
+
+            // 스스로 끊을 차례 (churn) — 부하 한가운데서 세션이 나가고 들어온다
+            if (c.churnAtNs != 0 && workStart >= c.churnAtNs)
+            {
+                Kill(c, false);
+                continue;
+            }
+
+            // 응답이 끊긴 지 오래됐나 — 세션당 한 번만 센다(응답 오면 플래그 해제)
+            if (g_echoMode && c.pending > 0 && !c.notRecvFlagged &&
+                workStart - c.lastRecvNs > static_cast<int64_t>(g_echoTimeoutMs) * 1000000)
+            {
+                g_stats.echoNotRecv.Inc();
+                c.notRecvFlagged = true;
+            }
+
+            if (workStart < c.nextInputNs)
+                continue;
+
             if (g_echoMode)
             {
-                EchoPacket e{};
-                e.header.size = sizeof(e);
-                e.header.type = static_cast<uint16_t>(MsgType::ECHO);
-                e.sentNs      = NowNs();
-                SendBytes(c, &e, sizeof(e));
+                // 과부하 윈도우 — 미응답이 상한이면 이번 차례는 거른다 (0 = 제한 없음)
+                if (g_overSend > 0 && c.pending >= g_overSend)
+                {
+                    c.nextInputNs = (c.nextInputNs == 0 ? workStart : c.nextInputNs) + inputPeriodNs;
+                    continue;
+                }
+                SendEcho(c, i);
                 if (c.state == CState::Dead) continue;
-                if (!c.pend.empty()) UpdateWrite(c, i, true);
-                ++_local.echoSent;
             }
             else
             {
@@ -504,7 +749,20 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--ramp") && i + 1 < argc) ramp = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--metrics-port") && i + 1 < argc) mport = static_cast<uint16_t>(std::atoi(argv[++i]));
         else if (!std::strcmp(argv[i], "--mode") && i + 1 < argc) g_echoMode = (std::strcmp(argv[++i], "echo") == 0);
+        else if (!std::strcmp(argv[i], "--verify") && i + 1 < argc) g_verify = std::atoi(argv[++i]) != 0;
+        else if (!std::strcmp(argv[i], "--pkt-min") && i + 1 < argc) g_pktMin = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--pkt-max") && i + 1 < argc) g_pktMax = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--over-send") && i + 1 < argc) g_overSend = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--echo-timeout-ms") && i + 1 < argc) g_echoTimeoutMs = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--churn-ms") && i + 1 < argc) g_churnMs = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--reconnect-ms") && i + 1 < argc) g_reconnectMs = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--fail-fast") && i + 1 < argc) g_failFast = std::atoi(argv[++i]) != 0;
     }
+
+    // 크기 범위 정리 — 머리 20B 미만이면 검증 자체가 성립 안 하고, 서버 상한을 넘으면 서버가 끊는다
+    if (g_pktMin < static_cast<int>(kEchoMin)) g_pktMin = static_cast<int>(kEchoMin);
+    if (g_pktMax > static_cast<int>(MAX_PACKET_SIZE)) g_pktMax = static_cast<int>(MAX_PACKET_SIZE);
+    if (g_pktMax < g_pktMin) g_pktMax = g_pktMin;
     if (threads <= 0)
         threads = (sessions + 1499) / 1500;      // MMO 유효성 경계(1,800/스레드) 아래로
 
@@ -516,6 +774,10 @@ int main(int argc, char** argv)
     std::printf("belt_dummy: %s:%u sessions %d / threads %d / %s %dHz / %ds\n",
                 host, static_cast<unsigned>(port), sessions, threads,
                 g_echoMode ? "echo" : "input", inputHz, runSecs);
+    if (g_echoMode)
+        std::printf("belt_dummy: 검증 %s / 패킷 %d~%dB / 미응답창 %d / 타임아웃 %dms / churn %dms / failFast %s\n",
+                    g_verify ? "켬" : "끔", g_pktMin, g_pktMax, g_overSend,
+                    g_echoTimeoutMs, g_churnMs, g_failFast ? "켬" : "끔");
 
     const int64_t deadline = NowNs() + static_cast<int64_t>(runSecs) * 1000000000;
     std::vector<std::unique_ptr<Worker>> workers;
@@ -553,20 +815,38 @@ int main(int argc, char** argv)
     {
         const int64_t sent   = g_stats.echoSent.Load();
         const int64_t recv   = g_stats.echoRecv.Load();
+        const int64_t padErr = g_stats.padError.Load();
+        const int64_t ordErr = g_stats.orderError.Load();
         const int64_t rttP99 = p99Of(g_stats.rttBucket, kRttBucketUs, kRttBuckets);
-        // 마지막 왕복은 아직 오는 중일 수 있다 — 세션당 1개까지만 봐준다
-        const bool ok = joined == sessions && recv >= sent - sessions &&
-                        bufFull == 0 && closed == 0 && loopOk;
+
+        // churn 을 켜면 세션이 오가므로 접속 누계·서버발 끊김은 게이트에서 뺀다
+        const bool churning  = g_churnMs > 0;
+        const bool connectOk = churning ? (joined >= sessions) : (joined == sessions);
+        const bool closeOk   = churning ? true : (closed == 0);
+        // 마지막 왕복은 아직 오는 중일 수 있다 — 세션당 1개까지만 봐준다.
+        // 과부하 창을 열어두면 미응답이 그만큼 더 남으므로 상한도 그만큼 넓힌다.
+        const int64_t inflightAllow = static_cast<int64_t>(sessions) *
+                                      (g_overSend > 0 ? g_overSend : 1);
+        const bool ok = connectOk && closeOk && recv >= sent - inflightAllow &&
+                        padErr == 0 && ordErr == 0 && bufFull == 0 && loopOk;
+
         std::printf("belt_dummy: connected %lld/%d, echo %lld sent / %lld recv (%lld 미도착), "
+                    "padErr %lld, orderErr %lld, late %lld, notRecv %lld, reconnect %lld, "
                     "rtt p99<=%lldus max %lldus, bufFull %lld, serverClosed %lld, "
                     "loop p99<=%lldus max %lldus — %s\n",
                     static_cast<long long>(joined), sessions,
                     static_cast<long long>(sent), static_cast<long long>(recv),
                     static_cast<long long>(sent - recv),
+                    static_cast<long long>(padErr), static_cast<long long>(ordErr),
+                    static_cast<long long>(g_stats.lateArrival.Load()),
+                    static_cast<long long>(g_stats.echoNotRecv.Load()),
+                    static_cast<long long>(g_stats.reconnects.Load()),
                     static_cast<long long>(rttP99), static_cast<long long>(g_stats.rttMaxUs.Load()),
                     static_cast<long long>(bufFull), static_cast<long long>(closed),
                     static_cast<long long>(p99Le), static_cast<long long>(g_stats.loopMaxUs.Load()),
                     ok ? "GATE OK" : "GATE FAIL");
+        if (padErr != 0 || ordErr != 0)
+            std::printf("belt_dummy: ★ 무결성 위반 — 자세한 내용은 %s\n", kDumpPath);
         return ok ? 0 : 1;
     }
 
